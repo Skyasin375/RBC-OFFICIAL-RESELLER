@@ -2,7 +2,10 @@
 """
 RBC LEVEL UP - Professional Web Dashboard & Real-Time EXP Tracker
 Embedded Async Web Server (aiohttp)
-Fully working with:
+Render-ready build:
+  - CORS middleware for public deployment
+  - /healthz endpoint for Render health check
+  - Payment API proxy (fixes HTTPS mixed-content)
   - Bot state management
   - Account CRUD (add/delete/refresh/restart/stop)
   - Per-account isolation support (owner tracking in accounts.json)
@@ -18,17 +21,34 @@ import json
 import os
 import time
 from typing import Dict, List, Any, Optional
+
+import httpx
 from aiohttp import web
 
 # ==================== FILE PATHS ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "index.html")
 ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
-DATA_DIR = os.path.join(BASE_DIR, "data")
+
+# DATA_DIR can be overridden by Render disk mount (e.g. /var/data)
+DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    pass
+
 POPUP_FILE = os.path.join(DATA_DIR, "popup.json")
 TELEGRAM_FILE = os.path.join(DATA_DIR, "telegram.json")
 OWNERS_FILE = os.path.join(DATA_DIR, "owners.json")
 ALIASES_FILE = os.path.join(DATA_DIR, "aliases.json")
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+
+# Payment API (server-side proxy target)
+PAY_API_BASE = os.getenv("PAY_API_BASE", "https://fampaygateway.site/api")
+PAY_API_KEY = os.getenv("PAY_API_KEY", "FAM_7E06068D658196F192A94D47DF9C46500389DCBB")
+
+# Allowed CORS origins. "*" works for public dashboard.
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
 
 def _ensure_data_dir():
@@ -50,9 +70,7 @@ class BotState:
         self.account_workers: Dict[str, asyncio.Task] = {}
         self.refresh_callbacks: Dict[str, Any] = {}
         self.account_credentials: Dict[str, Dict[str, Any]] = {}
-        # uid -> email owner map (for per-user isolation)
         self.owners: Dict[str, str] = {}
-        # input_uid -> canonical bot account_id map (bridges input vs real UID)
         self.uid_aliases: Dict[str, str] = {}
 
     def log(self, message: str, level: str = "info", uid: Optional[str] = None):
@@ -67,19 +85,9 @@ class BotState:
             self.logs.pop(0)
 
     def register_account(self, uid: str, nickname: str, region: str, level: int, exp: int, likes: int = 0):
-        """
-        Register or update an account.
-
-        IMPORTANT: `initial_exp` is the baseline used to compute `gained_exp`.
-        It must be preserved across re-registrations. Only rebase it when the
-        server reports a smaller exp than the current baseline (account reset /
-        decay / fresh season) so `gained_exp` never goes artificially negative
-        or wildly positive.
-        """
         uid_str = str(uid)
 
         if uid_str not in self.accounts:
-            # First time seeing this account — set baseline to current exp
             self.accounts[uid_str] = {
                 "uid": uid_str,
                 "nickname": nickname or f"Player_{uid_str[:6]}",
@@ -99,7 +107,6 @@ class BotState:
         else:
             acc = self.accounts[uid_str]
 
-            # Update descriptive fields
             if nickname:
                 acc["nickname"] = nickname
             if region:
@@ -107,25 +114,17 @@ class BotState:
             if level and level > 0:
                 acc["level"] = level
 
-            # --- Preserve initial_exp baseline ---
             if "initial_exp" not in acc or acc.get("initial_exp") is None:
                 acc["initial_exp"] = int(exp or 0)
             elif exp and int(exp) < int(acc["initial_exp"]):
-                # Server reports a lower exp than our baseline → rebase
-                # (e.g. new season, account reset, or first-seen was wrong)
                 acc["initial_exp"] = int(exp)
 
-            # --- Only advance current_exp when we have a real (>0) value ---
-            # This prevents a failed profile fetch (exp=0 default) from
-            # wiping out a good value already in the cache.
             prev_current = int(acc.get("current_exp") or 0)
             if int(exp or 0) > 0:
                 acc["current_exp"] = int(exp)
             elif prev_current == 0:
-                # Never had a real value — accept the 0 as-is
                 acc["current_exp"] = int(exp or 0)
 
-            # --- Recompute gained_exp against preserved baseline ---
             acc["gained_exp"] = max(0, int(acc["current_exp"]) - int(acc["initial_exp"]))
 
             if likes and likes > 0:
@@ -137,10 +136,6 @@ class BotState:
         self.recalc_totals()
 
     def update_exp(self, uid: str, current_exp: int, level: Optional[int] = None):
-        """
-        Update a running account's exp/level from a live profile fetch.
-        Preserves initial_exp baseline; recomputes gained_exp.
-        """
         uid_str = str(uid)
         if uid_str not in self.accounts:
             return
@@ -149,14 +144,12 @@ class BotState:
         old_exp = int(acc.get("current_exp") or 0)
         new_exp = int(current_exp or 0)
 
-        # Accept the new value if it's > 0 (real) OR if we had nothing before
         if new_exp > 0 or old_exp == 0:
             acc["current_exp"] = new_exp
 
         if level is not None and int(level) > 0:
             acc["level"] = int(level)
 
-        # Rebase baseline if server reports an exp lower than it
         baseline = int(acc.get("initial_exp") or 0)
         if new_exp > 0 and new_exp < baseline:
             acc["initial_exp"] = new_exp
@@ -206,18 +199,11 @@ class BotState:
             self.accounts[uid_str]["owner"] = owner_email
 
     def set_alias(self, input_uid: str, canonical_uid: str):
-        """
-        Called by app.py once the bot resolves the real account_id.
-        Maps the input UID (or token prefix) the user provided at add-time to
-        the canonical bot account_id. Also transfers ownership so the frontend
-        recognizes the real account as belonging to the same user.
-        """
         if not input_uid or not canonical_uid:
             return
         input_str = str(input_uid)
         canon_str = str(canonical_uid)
         self.uid_aliases[input_str] = canon_str
-        # Also add a self-alias so canonical lookups are stable
         self.uid_aliases.setdefault(canon_str, canon_str)
 
         owner = self.owners.get(input_str)
@@ -255,7 +241,6 @@ def _write_json(path: str, data) -> bool:
 
 
 def _load_owners_into_state():
-    """On startup, load owners map from data/owners.json"""
     data = _read_json(OWNERS_FILE, {})
     if isinstance(data, dict):
         bot_state.owners = data
@@ -268,7 +253,6 @@ def _save_owners_from_state():
 
 
 def _load_aliases_into_state():
-    """On startup, load aliases map from data/aliases.json"""
     data = _read_json(ALIASES_FILE, {})
     if isinstance(data, dict):
         bot_state.uid_aliases = data
@@ -278,6 +262,43 @@ def _load_aliases_into_state():
 
 def _save_aliases_from_state():
     _write_json(ALIASES_FILE, bot_state.uid_aliases)
+
+
+# ==================== CORS MIDDLEWARE ====================
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    """Allow public cross-origin requests + handle OPTIONS preflight."""
+    if request.method == "OPTIONS":
+        response = web.Response(status=204)
+    else:
+        try:
+            response = await handler(request)
+        except web.HTTPException as ex:
+            response = ex
+        except Exception as e:
+            bot_state.log(f"Handler error: {e}", "error")
+            response = web.json_response(
+                {"status": "error", "error": str(e)}, status=500
+            )
+
+    origin = request.headers.get("Origin", "")
+
+    if ALLOWED_ORIGINS.strip() == "*":
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    elif origin and origin in [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Max-Age"] = "86400"
+
+    # Security headers (safe for a public dashboard)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+
+    return response
 
 
 # ==================== HTTP HANDLERS ====================
@@ -300,13 +321,17 @@ async def handle_index(request: web.Request) -> web.Response:
     )
 
 
+async def handle_health(request: web.Request) -> web.Response:
+    """Render health check endpoint."""
+    return web.json_response({
+        "status": "ok",
+        "service": "rbc-level-dashboard",
+        "uptime": int(time.time() - bot_state.start_time),
+        "accounts": len(bot_state.accounts)
+    })
+
+
 async def handle_get_stats(request: web.Request) -> web.Response:
-    """
-    Return all bot stats. Each account includes its owner email.
-    Also exposes `owners` (canonical uid -> owner email) and `aliases`
-    (input uid -> canonical uid) so the frontend can link input accounts
-    to the real bot account_id.
-    """
     accounts_data = list(bot_state.accounts.values())
     accounts_data.sort(key=lambda x: int(x.get("gained_exp", 0) or 0), reverse=True)
     return web.json_response({
@@ -323,7 +348,6 @@ async def handle_get_stats(request: web.Request) -> web.Response:
 
 
 async def handle_add_account(request: web.Request) -> web.Response:
-    """Add a new account. Body may include `owner` for per-user isolation."""
     try:
         data = await request.json()
         existing = _read_json(ACCOUNTS_FILE, [])
@@ -359,16 +383,12 @@ async def handle_add_account(request: web.Request) -> web.Response:
         _write_json(ACCOUNTS_FILE, existing)
         bot_state.log(f"New account added: {label}", "success")
 
-        # Set owner in state if provided
         if owner_email:
             bot_state.set_owner(label, owner_email)
             _save_owners_from_state()
-            # Seed a self-alias so the alias map has a stable entry from day 1.
-            # app.py will overwrite this with the canonical UID after login.
             bot_state.uid_aliases.setdefault(str(label), str(label))
             _save_aliases_from_state()
 
-        # Trigger worker launch if callback registered
         cb = bot_state.refresh_callbacks.get("on_account_added")
         if cb:
             try:
@@ -382,7 +402,6 @@ async def handle_add_account(request: web.Request) -> web.Response:
 
 
 async def handle_delete_account(request: web.Request) -> web.Response:
-    """Remove an account permanently."""
     try:
         data = await request.json()
         uid = str(data.get("uid", "")).strip()
@@ -408,7 +427,6 @@ async def handle_delete_account(request: web.Request) -> web.Response:
             del bot_state.owners[uid]
             _save_owners_from_state()
 
-        # Clean aliases pointing to or from this uid
         changed_alias = False
         for k in list(bot_state.uid_aliases.keys()):
             if k == uid or bot_state.uid_aliases[k] == uid:
@@ -424,12 +442,10 @@ async def handle_delete_account(request: web.Request) -> web.Response:
 
 
 async def handle_remove_account(request: web.Request) -> web.Response:
-    """Alias for handle_delete_account — used by the frontend 'Remove' button."""
     return await handle_delete_account(request)
 
 
 async def handle_refresh_account(request: web.Request) -> web.Response:
-    """Trigger a manual refresh of an account's profile."""
     try:
         data = await request.json()
         uid = str(data.get("uid", "")).strip()
@@ -450,14 +466,12 @@ async def handle_refresh_account(request: web.Request) -> web.Response:
 
 
 async def handle_restart_account(request: web.Request) -> web.Response:
-    """Restart bot worker for a specific account (cancel + relaunch)."""
     try:
         data = await request.json()
         uid = str(data.get("uid", "")).strip()
         if not uid:
             return web.json_response({"status": "error", "error": "UID required"})
 
-        # Cancel existing worker
         if uid in bot_state.account_workers:
             try:
                 bot_state.account_workers[uid].cancel()
@@ -465,7 +479,6 @@ async def handle_restart_account(request: web.Request) -> web.Response:
                 pass
             del bot_state.account_workers[uid]
 
-        # Trigger restart callback
         cb = bot_state.refresh_callbacks.get("on_restart_account")
         if cb:
             try:
@@ -480,7 +493,6 @@ async def handle_restart_account(request: web.Request) -> web.Response:
 
 
 async def handle_stop_account(request: web.Request) -> web.Response:
-    """Stop bot worker for an account without deleting it."""
     try:
         data = await request.json()
         uid = str(data.get("uid", "")).strip()
@@ -504,7 +516,6 @@ async def handle_stop_account(request: web.Request) -> web.Response:
 
 
 async def handle_get_console(request: web.Request) -> web.Response:
-    """Return bot logs for the live console page."""
     return web.json_response({
         "status": "ok",
         "logs": bot_state.logs[-200:],
@@ -515,10 +526,48 @@ async def handle_get_console(request: web.Request) -> web.Response:
     })
 
 
+# ==================== PAYMENT PROXY ====================
+# Fixes mixed-content on HTTPS: browser → this backend (HTTPS) → provider (HTTP/HTTPS)
+
+async def handle_pay_create(request: web.Request) -> web.Response:
+    amount = request.query.get("amount", "0")
+    url = f"{PAY_API_BASE}/create_order.php?amount={amount}&api_key={PAY_API_KEY}"
+    try:
+        async with httpx.AsyncClient(timeout=15, verify=False) as c:
+            r = await c.get(url)
+        try:
+            return web.json_response(r.json())
+        except Exception:
+            return web.json_response(
+                {"status": "error", "message": "Invalid response from payment gateway",
+                 "raw": r.text[:300]},
+                status=502
+            )
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=502)
+
+
+async def handle_pay_verify(request: web.Request) -> web.Response:
+    order_id = request.query.get("order_id", "")
+    url = f"{PAY_API_BASE}/verify.php?order_id={order_id}&api_key={PAY_API_KEY}"
+    try:
+        async with httpx.AsyncClient(timeout=15, verify=False) as c:
+            r = await c.get(url)
+        try:
+            return web.json_response(r.json())
+        except Exception:
+            return web.json_response(
+                {"status": "error", "message": "Invalid response from payment gateway",
+                 "raw": r.text[:300]},
+                status=502
+            )
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=502)
+
+
 # ==================== POPUP SETTINGS ====================
 
 async def handle_get_popup(request: web.Request) -> web.Response:
-    """Return landing-page popup config."""
     default = {
         "enabled": False,
         "header": "Important Update",
@@ -537,7 +586,6 @@ async def handle_get_popup(request: web.Request) -> web.Response:
 
 
 async def handle_save_popup(request: web.Request) -> web.Response:
-    """Save popup settings."""
     try:
         data = await request.json()
         if not isinstance(data, dict):
@@ -554,7 +602,6 @@ async def handle_save_popup(request: web.Request) -> web.Response:
 # ==================== TELEGRAM SETTINGS ====================
 
 async def handle_get_telegram(request: web.Request) -> web.Response:
-    """Return telegram contact config."""
     default = {
         "link": "https://t.me/RexBullYasin",
         "username": "@RexBullYasin"
@@ -566,7 +613,6 @@ async def handle_get_telegram(request: web.Request) -> web.Response:
 
 
 async def handle_save_telegram(request: web.Request) -> web.Response:
-    """Save telegram config."""
     try:
         data = await request.json()
         if not isinstance(data, dict):
@@ -579,10 +625,9 @@ async def handle_save_telegram(request: web.Request) -> web.Response:
         return web.json_response({"status": "error", "error": str(e)})
 
 
-# ==================== OWNERS + ALIASES (per-user isolation) ====================
+# ==================== OWNERS + ALIASES ====================
 
 async def handle_get_owners(request: web.Request) -> web.Response:
-    """Return uid -> owner_email map (used by frontend)."""
     return web.json_response({
         "status": "ok",
         "owners": bot_state.owners,
@@ -591,7 +636,6 @@ async def handle_get_owners(request: web.Request) -> web.Response:
 
 
 async def handle_set_owner(request: web.Request) -> web.Response:
-    """Set the owner of a UID (called after add-account from user panel)."""
     try:
         data = await request.json()
         uid = str(data.get("uid", "")).strip()
@@ -606,10 +650,6 @@ async def handle_set_owner(request: web.Request) -> web.Response:
 
 
 async def handle_set_alias(request: web.Request) -> web.Response:
-    """
-    Manually link an input UID (or token prefix) to a canonical bot account_id.
-    Usually called automatically by app.py after login, but exposed here as well.
-    """
     try:
         data = await request.json()
         input_uid = str(data.get("input_uid", "")).strip()
@@ -624,13 +664,9 @@ async def handle_set_alias(request: web.Request) -> web.Response:
         return web.json_response({"status": "error", "error": str(e)})
 
 
-# ==================== PUBLIC CONFIG (CFG bridge for frontend) ====================
-
-CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
-
+# ==================== PUBLIC CONFIG ====================
 
 async def handle_get_config(request: web.Request) -> web.Response:
-    """Return site-wide config (maintenance, broadcast, plans, etc.)."""
     default = {
         "maintenance": False,
         "maint_msg": "We are upgrading the system. Back shortly.",
@@ -648,7 +684,6 @@ async def handle_get_config(request: web.Request) -> web.Response:
 
 
 async def handle_save_config(request: web.Request) -> web.Response:
-    """Save site config (called from admin panel)."""
     try:
         data = await request.json()
         if not isinstance(data, dict):
@@ -680,19 +715,18 @@ async def handle_on_cleanup(app: web.Application):
 # ==================== SERVER START ====================
 
 async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
-    """
-    Start the aiohttp web server.
-    All routes are registered inside this function where `app` is defined.
-    """
-    app = web.Application()
+    """Start the aiohttp web server (Render-compatible)."""
+    app = web.Application(middlewares=[cors_middleware])
 
-    # Lifecycle hooks
     app.on_startup.append(handle_on_startup)
     app.on_cleanup.append(handle_on_cleanup)
 
     # ---------- ROUTES ----------
-    # Main SPA
     app.router.add_get("/", handle_index)
+
+    # Health check (Render uses this)
+    app.router.add_get("/healthz", handle_health)
+    app.router.add_get("/api/health", handle_health)
 
     # Bot stats & account management
     app.router.add_get("/api/stats", handle_get_stats)
@@ -706,6 +740,10 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     # Console logs
     app.router.add_get("/api/console", handle_get_console)
 
+    # Payment proxy (fixes HTTPS mixed content)
+    app.router.add_get("/api/pay/create", handle_pay_create)
+    app.router.add_get("/api/pay/verify", handle_pay_verify)
+
     # Popup settings
     app.router.add_get("/api/public/popup", handle_get_popup)
     app.router.add_post("/api/admin/save-popup", handle_save_popup)
@@ -714,12 +752,12 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     app.router.add_get("/api/public/telegram", handle_get_telegram)
     app.router.add_post("/api/admin/save-telegram", handle_save_telegram)
 
-    # Owners + aliases (per-user isolation)
+    # Owners + aliases
     app.router.add_get("/api/owners", handle_get_owners)
     app.router.add_post("/api/set-owner", handle_set_owner)
     app.router.add_post("/api/set-alias", handle_set_alias)
 
-    # Site config (CFG bridge)
+    # Site config
     app.router.add_get("/api/public/config", handle_get_config)
     app.router.add_post("/api/admin/save-config", handle_save_config)
 
@@ -729,8 +767,9 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     site = web.TCPSite(runner, host, port)
     await site.start()
 
-    print(f"\033[92m[+] RBC LEVEL UP Dashboard running on http://localhost:{port}\033[0m")
-    print(f"\033[92m[+] Open in browser: http://127.0.0.1:{port}\033[0m")
+    print(f"\033[92m[+] RBC LEVEL UP Dashboard running on http://{host}:{port}\033[0m")
+    print(f"\033[92m[+] Health check: http://{host}:{port}/healthz\033[0m")
+    print(f"\033[92m[+] Payment proxy: /api/pay/create  /api/pay/verify\033[0m")
 
     return runner
 
@@ -740,7 +779,8 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
 if __name__ == "__main__":
     async def _test_main():
         print("[TEST] Starting dashboard_server.py standalone...")
-        runner = await start_web_dashboard(host="0.0.0.0", port=20335)
+        port = int(os.getenv("PORT", "20335"))
+        runner = await start_web_dashboard(host="0.0.0.0", port=port)
         try:
             while True:
                 await asyncio.sleep(3600)
