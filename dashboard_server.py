@@ -1,19 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RBC LEVEL UP - Professional Web Dashboard & Real-Time EXP Tracker
-Embedded Async Web Server (aiohttp)
-Render-ready build:
-  - CORS middleware for public deployment
-  - /healthz endpoint for Render health check
-  - Payment API proxy (fixes HTTPS mixed-content)
-  - Bot state management
-  - Account CRUD (add/delete/refresh/restart/stop)
-  - Per-account isolation support (owner tracking in accounts.json)
-  - UID alias mapping (input UID → canonical bot account_id)
-  - Popup notification settings (landing page)
-  - Telegram contact settings
-  - Console logs endpoint
-  - Real profile fields (level/exp/likes) preserved correctly on re-registration
+RBC LEVEL UP - Dashboard Server (Render-ready + multi-device login)
 """
 
 import asyncio
@@ -30,7 +17,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "index.html")
 ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
 
-# DATA_DIR can be overridden by Render disk mount (e.g. /var/data)
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -42,12 +28,18 @@ TELEGRAM_FILE = os.path.join(DATA_DIR, "telegram.json")
 OWNERS_FILE = os.path.join(DATA_DIR, "owners.json")
 ALIASES_FILE = os.path.join(DATA_DIR, "aliases.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+CREDS_FILE = os.path.join(DATA_DIR, "credentials.json")
 
-# Payment API (server-side proxy target)
+# Admin credentials (env override)
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "skyasinali221@gmail.com")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "skyasin")
+
+# Payment API
 PAY_API_BASE = os.getenv("PAY_API_BASE", "https://fampaygateway.site/api")
 PAY_API_KEY = os.getenv("PAY_API_KEY", "FAM_7E06068D658196F192A94D47DF9C46500389DCBB")
 
-# Allowed CORS origins. "*" works for public dashboard.
+# CORS
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
 
@@ -86,7 +78,6 @@ class BotState:
 
     def register_account(self, uid: str, nickname: str, region: str, level: int, exp: int, likes: int = 0):
         uid_str = str(uid)
-
         if uid_str not in self.accounts:
             self.accounts[uid_str] = {
                 "uid": uid_str,
@@ -106,58 +97,41 @@ class BotState:
             }
         else:
             acc = self.accounts[uid_str]
-
-            if nickname:
-                acc["nickname"] = nickname
-            if region:
-                acc["region"] = region
-            if level and level > 0:
-                acc["level"] = level
-
+            if nickname: acc["nickname"] = nickname
+            if region: acc["region"] = region
+            if level and level > 0: acc["level"] = level
             if "initial_exp" not in acc or acc.get("initial_exp") is None:
                 acc["initial_exp"] = int(exp or 0)
             elif exp and int(exp) < int(acc["initial_exp"]):
                 acc["initial_exp"] = int(exp)
-
             prev_current = int(acc.get("current_exp") or 0)
             if int(exp or 0) > 0:
                 acc["current_exp"] = int(exp)
             elif prev_current == 0:
                 acc["current_exp"] = int(exp or 0)
-
             acc["gained_exp"] = max(0, int(acc["current_exp"]) - int(acc["initial_exp"]))
-
-            if likes and likes > 0:
-                acc["likes"] = likes
+            if likes and likes > 0: acc["likes"] = likes
             acc["status"] = "ONLINE"
             acc["last_updated"] = time.strftime("%H:%M:%S")
             acc["owner"] = self.owners.get(uid_str, acc.get("owner", ""))
-
         self.recalc_totals()
 
     def update_exp(self, uid: str, current_exp: int, level: Optional[int] = None):
         uid_str = str(uid)
-        if uid_str not in self.accounts:
-            return
-
+        if uid_str not in self.accounts: return
         acc = self.accounts[uid_str]
         old_exp = int(acc.get("current_exp") or 0)
         new_exp = int(current_exp or 0)
-
         if new_exp > 0 or old_exp == 0:
             acc["current_exp"] = new_exp
-
         if level is not None and int(level) > 0:
             acc["level"] = int(level)
-
         baseline = int(acc.get("initial_exp") or 0)
         if new_exp > 0 and new_exp < baseline:
             acc["initial_exp"] = new_exp
             baseline = new_exp
-
         acc["gained_exp"] = max(0, int(acc["current_exp"]) - baseline)
         acc["last_updated"] = time.strftime("%H:%M:%S")
-
         diff = int(acc["current_exp"]) - old_exp
         if diff > 0:
             self.log(
@@ -199,13 +173,11 @@ class BotState:
             self.accounts[uid_str]["owner"] = owner_email
 
     def set_alias(self, input_uid: str, canonical_uid: str):
-        if not input_uid or not canonical_uid:
-            return
+        if not input_uid or not canonical_uid: return
         input_str = str(input_uid)
         canon_str = str(canonical_uid)
         self.uid_aliases[input_str] = canon_str
         self.uid_aliases.setdefault(canon_str, canon_str)
-
         owner = self.owners.get(input_str)
         if owner:
             self.owners[canon_str] = owner
@@ -218,8 +190,7 @@ bot_state = BotState()
 
 # ==================== HELPERS ====================
 def _read_json(path: str, default):
-    if not os.path.exists(path):
-        return default
+    if not os.path.exists(path): return default
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -242,10 +213,7 @@ def _write_json(path: str, data) -> bool:
 
 def _load_owners_into_state():
     data = _read_json(OWNERS_FILE, {})
-    if isinstance(data, dict):
-        bot_state.owners = data
-    else:
-        bot_state.owners = {}
+    bot_state.owners = data if isinstance(data, dict) else {}
 
 
 def _save_owners_from_state():
@@ -254,20 +222,34 @@ def _save_owners_from_state():
 
 def _load_aliases_into_state():
     data = _read_json(ALIASES_FILE, {})
-    if isinstance(data, dict):
-        bot_state.uid_aliases = data
-    else:
-        bot_state.uid_aliases = {}
+    bot_state.uid_aliases = data if isinstance(data, dict) else {}
 
 
 def _save_aliases_from_state():
     _write_json(ALIASES_FILE, bot_state.uid_aliases)
 
 
+def _load_users():
+    data = _read_json(USERS_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def _save_users(users):
+    return _write_json(USERS_FILE, users)
+
+
+def _load_creds():
+    data = _read_json(CREDS_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def _save_creds(creds):
+    return _write_json(CREDS_FILE, creds)
+
+
 # ==================== CORS MIDDLEWARE ====================
 @web.middleware
 async def cors_middleware(request: web.Request, handler):
-    """Allow public cross-origin requests + handle OPTIONS preflight."""
     if request.method == "OPTIONS":
         response = web.Response(status=204)
     else:
@@ -277,12 +259,9 @@ async def cors_middleware(request: web.Request, handler):
             response = ex
         except Exception as e:
             bot_state.log(f"Handler error: {e}", "error")
-            response = web.json_response(
-                {"status": "error", "error": str(e)}, status=500
-            )
+            response = web.json_response({"status": "error", "error": str(e)}, status=500)
 
     origin = request.headers.get("Origin", "")
-
     if ALLOWED_ORIGINS.strip() == "*":
         response.headers["Access-Control-Allow-Origin"] = "*"
     elif origin and origin in [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]:
@@ -292,37 +271,26 @@ async def cors_middleware(request: web.Request, handler):
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     response.headers["Access-Control-Max-Age"] = "86400"
-
-    # Security headers (safe for a public dashboard)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-
     return response
 
 
-# ==================== HTTP HANDLERS ====================
+# ==================== BASIC HANDLERS ====================
 
 async def handle_index(request: web.Request) -> web.Response:
-    """Serve the SPA (templates/index.html)."""
     if os.path.exists(TEMPLATE_PATH):
         try:
             with open(TEMPLATE_PATH, "r", encoding="utf-8") as f:
                 content = f.read()
             return web.Response(text=content, content_type="text/html", charset="utf-8")
         except Exception as e:
-            return web.Response(
-                text=f"<h1>Error loading template: {e}</h1>",
-                content_type="text/html", status=500
-            )
-    return web.Response(
-        text=f"<h1>templates/index.html not found!</h1><p>Expected path: {TEMPLATE_PATH}</p>",
-        content_type="text/html", status=404
-    )
+            return web.Response(text=f"<h1>Error: {e}</h1>", content_type="text/html", status=500)
+    return web.Response(text=f"<h1>templates/index.html not found</h1>", content_type="text/html", status=404)
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    """Render health check endpoint."""
     return web.json_response({
         "status": "ok",
         "service": "rbc-level-dashboard",
@@ -347,6 +315,133 @@ async def handle_get_stats(request: web.Request) -> web.Response:
     })
 
 
+# ==================== AUTH (server-side users) ====================
+
+async def handle_auth_login(request: web.Request) -> web.Response:
+    """Authenticate user against server-side store (works from any device)."""
+    try:
+        data = await request.json()
+        email = str(data.get("email", "")).strip().lower()
+        password = str(data.get("password", ""))
+        if not email or not password:
+            return web.json_response({"status": "error", "error": "email & password required"})
+
+        # Admin
+        if email == ADMIN_EMAIL.lower() and password == ADMIN_PASSWORD:
+            bot_state.log(f"Admin login: {email}", "success")
+            return web.json_response({
+                "status": "ok",
+                "role": "admin",
+                "email": ADMIN_EMAIL
+            })
+
+        users = _load_users()
+        user = next((u for u in users if str(u.get("email", "")).lower() == email), None)
+        if not user or user.get("password") != password:
+            bot_state.log(f"Failed login attempt: {email}", "warning")
+            return web.json_response({"status": "error", "error": "Invalid email or password"}, status=401)
+
+        creds = _load_creds()
+        cred = next((c for c in creds if str(c.get("email", "")).lower() == email), None)
+        if not cred:
+            return web.json_response({"status": "error", "error": "No plan found for this account"}, status=403)
+
+        if cred.get("revoked"):
+            return web.json_response({"status": "error", "error": "Credentials revoked"}, status=403)
+
+        exp = cred.get("expiresAt") or 0
+        if exp and exp > 0 and int(time.time() * 1000) > exp:
+            return web.json_response({"status": "error", "error": "Plan expired"}, status=403)
+
+        bot_state.log(f"User login: {email}", "success")
+        return web.json_response({
+            "status": "ok",
+            "role": "user",
+            "email": email,
+            "user": user,
+            "credential": cred
+        })
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)}, status=500)
+
+
+async def handle_create_user(request: web.Request) -> web.Response:
+    """Create a user + credential pair on the server (works from any device)."""
+    try:
+        data = await request.json()
+        email = str(data.get("email", "")).strip().lower()
+        password = str(data.get("password", ""))
+        slots = int(data.get("slots", 3))
+        days = int(data.get("days", 7))
+        label = str(data.get("label", "AUTO"))
+        owner = str(data.get("owner", "")).strip().lower()
+
+        if not email or not password:
+            return web.json_response({"status": "error", "error": "email & password required"})
+
+        now_ms = int(time.time() * 1000)
+        expires_at = now_ms + days * 86400000 if days > 0 else 0
+
+        users = _load_users()
+        users = [u for u in users if str(u.get("email", "")).lower() != email]
+        users.append({
+            "name": "User",
+            "email": email,
+            "password": password,
+            "createdAt": now_ms
+        })
+        _save_users(users)
+
+        creds = _load_creds()
+        creds = [c for c in creds if str(c.get("email", "")).lower() != email]
+        creds.insert(0, {
+            "email": email,
+            "password": password,
+            "slots": slots,
+            "label": label,
+            "revoked": False,
+            "created_at": now_ms,
+            "expiresAt": expires_at,
+            "days": days
+        })
+        _save_creds(creds)
+
+        if owner:
+            bot_state.set_owner(email, owner)
+            _save_owners_from_state()
+
+        bot_state.log(f"User created: {email} ({slots} slots, {days} days)", "success")
+        return web.json_response({"status": "ok", "email": email})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)}, status=500)
+
+
+async def handle_get_creds(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok", "credentials": _load_creds()})
+
+
+async def handle_save_creds(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        creds = data.get("credentials", [])
+        if not isinstance(creds, list):
+            return web.json_response({"status": "error", "error": "credentials must be a list"})
+        _save_creds(creds)
+        users = [{
+            "name": "User",
+            "email": c.get("email", ""),
+            "password": c.get("password", ""),
+            "createdAt": c.get("created_at", int(time.time() * 1000))
+        } for c in creds if c.get("email")]
+        _save_users(users)
+        bot_state.log(f"Credentials updated ({len(creds)} entries)", "success")
+        return web.json_response({"status": "ok"})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)}, status=500)
+
+
+# ==================== ACCOUNT MANAGEMENT ====================
+
 async def handle_add_account(request: web.Request) -> web.Response:
     try:
         data = await request.json()
@@ -363,8 +458,7 @@ async def handle_add_account(request: web.Request) -> web.Response:
                 return web.json_response({"status": "error", "error": "UID and Password are required"})
             existing = [acc for acc in existing if str(acc.get("uid")) != uid]
             entry = {"uid": uid, "password": pwd}
-            if owner_email:
-                entry["owner"] = owner_email
+            if owner_email: entry["owner"] = owner_email
             existing.append(entry)
             label = uid
         elif "token" in data:
@@ -373,8 +467,7 @@ async def handle_add_account(request: web.Request) -> web.Response:
                 return web.json_response({"status": "error", "error": "Token is required"})
             existing = [acc for acc in existing if acc.get("token") != token]
             entry = {"token": token}
-            if owner_email:
-                entry["owner"] = owner_email
+            if owner_email: entry["owner"] = owner_email
             existing.append(entry)
             label = token[:12]
         else:
@@ -415,27 +508,22 @@ async def handle_delete_account(request: web.Request) -> web.Response:
 
         if uid in bot_state.accounts:
             del bot_state.accounts[uid]
-
         if uid in bot_state.account_workers:
-            try:
-                bot_state.account_workers[uid].cancel()
-            except Exception:
-                pass
+            try: bot_state.account_workers[uid].cancel()
+            except Exception: pass
             del bot_state.account_workers[uid]
-
         if uid in bot_state.owners:
             del bot_state.owners[uid]
             _save_owners_from_state()
 
-        changed_alias = False
+        changed = False
         for k in list(bot_state.uid_aliases.keys()):
             if k == uid or bot_state.uid_aliases[k] == uid:
                 del bot_state.uid_aliases[k]
-                changed_alias = True
-        if changed_alias:
-            _save_aliases_from_state()
+                changed = True
+        if changed: _save_aliases_from_state()
 
-        bot_state.log(f"Account {uid} removed from rotation.", "warning", uid)
+        bot_state.log(f"Account {uid} removed.", "warning", uid)
         return web.json_response({"status": "ok"})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
@@ -451,14 +539,10 @@ async def handle_refresh_account(request: web.Request) -> web.Response:
         uid = str(data.get("uid", "")).strip()
         if not uid:
             return web.json_response({"status": "error", "error": "UID required"})
-
         cb = bot_state.refresh_callbacks.get("on_refresh_account")
         if cb:
-            try:
-                asyncio.create_task(cb(uid))
-            except Exception as e:
-                bot_state.log(f"on_refresh_account callback error: {e}", "error")
-
+            try: asyncio.create_task(cb(uid))
+            except Exception as e: bot_state.log(f"refresh cb error: {e}", "error")
         bot_state.log(f"Refresh requested for {uid}", "info", uid)
         return web.json_response({"status": "ok"})
     except Exception as e:
@@ -471,21 +555,14 @@ async def handle_restart_account(request: web.Request) -> web.Response:
         uid = str(data.get("uid", "")).strip()
         if not uid:
             return web.json_response({"status": "error", "error": "UID required"})
-
         if uid in bot_state.account_workers:
-            try:
-                bot_state.account_workers[uid].cancel()
-            except Exception:
-                pass
+            try: bot_state.account_workers[uid].cancel()
+            except Exception: pass
             del bot_state.account_workers[uid]
-
         cb = bot_state.refresh_callbacks.get("on_restart_account")
         if cb:
-            try:
-                asyncio.create_task(cb(uid))
-            except Exception as e:
-                bot_state.log(f"on_restart_account error: {e}", "error")
-
+            try: asyncio.create_task(cb(uid))
+            except Exception as e: bot_state.log(f"restart cb error: {e}", "error")
         bot_state.log(f"Restart requested for {uid}", "warning", uid)
         return web.json_response({"status": "ok"})
     except Exception as e:
@@ -498,17 +575,12 @@ async def handle_stop_account(request: web.Request) -> web.Response:
         uid = str(data.get("uid", "")).strip()
         if not uid:
             return web.json_response({"status": "error", "error": "UID required"})
-
         if uid in bot_state.accounts:
             bot_state.accounts[uid]["status"] = "PAUSED"
-
         if uid in bot_state.account_workers:
-            try:
-                bot_state.account_workers[uid].cancel()
-            except Exception:
-                pass
+            try: bot_state.account_workers[uid].cancel()
+            except Exception: pass
             del bot_state.account_workers[uid]
-
         bot_state.log(f"Bot stopped for {uid}", "warning", uid)
         return web.json_response({"status": "ok"})
     except Exception as e:
@@ -527,7 +599,6 @@ async def handle_get_console(request: web.Request) -> web.Response:
 
 
 # ==================== PAYMENT PROXY ====================
-# Fixes mixed-content on HTTPS: browser → this backend (HTTPS) → provider (HTTP/HTTPS)
 
 async def handle_pay_create(request: web.Request) -> web.Response:
     amount = request.query.get("amount", "0")
@@ -538,11 +609,7 @@ async def handle_pay_create(request: web.Request) -> web.Response:
         try:
             return web.json_response(r.json())
         except Exception:
-            return web.json_response(
-                {"status": "error", "message": "Invalid response from payment gateway",
-                 "raw": r.text[:300]},
-                status=502
-            )
+            return web.json_response({"status": "error", "message": "Invalid gateway response", "raw": r.text[:300]}, status=502)
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=502)
 
@@ -556,32 +623,21 @@ async def handle_pay_verify(request: web.Request) -> web.Response:
         try:
             return web.json_response(r.json())
         except Exception:
-            return web.json_response(
-                {"status": "error", "message": "Invalid response from payment gateway",
-                 "raw": r.text[:300]},
-                status=502
-            )
+            return web.json_response({"status": "error", "message": "Invalid gateway response", "raw": r.text[:300]}, status=502)
     except Exception as e:
         return web.json_response({"status": "error", "message": str(e)}, status=502)
 
 
-# ==================== POPUP SETTINGS ====================
+# ==================== POPUP / TELEGRAM / CONFIG ====================
 
 async def handle_get_popup(request: web.Request) -> web.Response:
     default = {
-        "enabled": False,
-        "header": "Important Update",
-        "title": "",
-        "message": "",
-        "button_text": "Chat Now",
-        "button_link": "https://t.me/RexBullYasin",
-        "icon_class": "fa-solid fa-circle-check",
-        "icon_color": "#22c55e",
-        "updated_at": 0
+        "enabled": False, "header": "Important Update", "title": "", "message": "",
+        "button_text": "Chat Now", "button_link": "https://t.me/RexBullYasin",
+        "icon_class": "fa-solid fa-circle-check", "icon_color": "#22c55e", "updated_at": 0
     }
     saved = _read_json(POPUP_FILE, {})
-    if isinstance(saved, dict):
-        default.update(saved)
+    if isinstance(saved, dict): default.update(saved)
     return web.json_response({"status": "ok", "popup": default})
 
 
@@ -599,16 +655,10 @@ async def handle_save_popup(request: web.Request) -> web.Response:
         return web.json_response({"status": "error", "error": str(e)})
 
 
-# ==================== TELEGRAM SETTINGS ====================
-
 async def handle_get_telegram(request: web.Request) -> web.Response:
-    default = {
-        "link": "https://t.me/RexBullYasin",
-        "username": "@RexBullYasin"
-    }
+    default = {"link": "https://t.me/RexBullYasin", "username": "@RexBullYasin"}
     saved = _read_json(TELEGRAM_FILE, {})
-    if isinstance(saved, dict):
-        default.update(saved)
+    if isinstance(saved, dict): default.update(saved)
     return web.json_response({"status": "ok", "telegram": default})
 
 
@@ -624,8 +674,6 @@ async def handle_save_telegram(request: web.Request) -> web.Response:
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
 
-
-# ==================== OWNERS + ALIASES ====================
 
 async def handle_get_owners(request: web.Request) -> web.Response:
     return web.json_response({
@@ -664,22 +712,15 @@ async def handle_set_alias(request: web.Request) -> web.Response:
         return web.json_response({"status": "error", "error": str(e)})
 
 
-# ==================== PUBLIC CONFIG ====================
-
 async def handle_get_config(request: web.Request) -> web.Response:
     default = {
-        "maintenance": False,
-        "maint_msg": "We are upgrading the system. Back shortly.",
+        "maintenance": False, "maint_msg": "We are upgrading the system. Back shortly.",
         "broadcast": {"on": False, "text": "", "type": "info", "id": ""},
-        "sales_open": True,
-        "site_name": "RBC LEVEL",
-        "hero_sub": "",
-        "plans": None,
-        "logo": ""
+        "sales_open": True, "site_name": "RBC LEVEL", "hero_sub": "",
+        "plans": None, "logo": ""
     }
     saved = _read_json(CONFIG_FILE, {})
-    if isinstance(saved, dict):
-        default.update(saved)
+    if isinstance(saved, dict): default.update(saved)
     return web.json_response({"status": "ok", "config": default})
 
 
@@ -715,20 +756,22 @@ async def handle_on_cleanup(app: web.Application):
 # ==================== SERVER START ====================
 
 async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
-    """Start the aiohttp web server (Render-compatible)."""
     app = web.Application(middlewares=[cors_middleware])
-
     app.on_startup.append(handle_on_startup)
     app.on_cleanup.append(handle_on_cleanup)
 
-    # ---------- ROUTES ----------
+    # Main
     app.router.add_get("/", handle_index)
-
-    # Health check (Render uses this)
     app.router.add_get("/healthz", handle_health)
     app.router.add_get("/api/health", handle_health)
 
-    # Bot stats & account management
+    # Auth (server-side)
+    app.router.add_post("/api/auth/login", handle_auth_login)
+    app.router.add_post("/api/user/create", handle_create_user)
+    app.router.add_get("/api/creds", handle_get_creds)
+    app.router.add_post("/api/creds/save", handle_save_creds)
+
+    # Stats & accounts
     app.router.add_get("/api/stats", handle_get_stats)
     app.router.add_post("/api/account/add", handle_add_account)
     app.router.add_post("/api/account/delete", handle_delete_account)
@@ -736,49 +779,42 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     app.router.add_post("/api/account/refresh", handle_refresh_account)
     app.router.add_post("/api/account/restart", handle_restart_account)
     app.router.add_post("/api/account/stop", handle_stop_account)
-
-    # Console logs
     app.router.add_get("/api/console", handle_get_console)
 
-    # Payment proxy (fixes HTTPS mixed content)
+    # Payment proxy
     app.router.add_get("/api/pay/create", handle_pay_create)
     app.router.add_get("/api/pay/verify", handle_pay_verify)
 
-    # Popup settings
+    # Popup / Telegram / Config
     app.router.add_get("/api/public/popup", handle_get_popup)
     app.router.add_post("/api/admin/save-popup", handle_save_popup)
-
-    # Telegram settings
     app.router.add_get("/api/public/telegram", handle_get_telegram)
     app.router.add_post("/api/admin/save-telegram", handle_save_telegram)
+    app.router.add_get("/api/public/config", handle_get_config)
+    app.router.add_post("/api/admin/save-config", handle_save_config)
 
-    # Owners + aliases
+    # Owners / Aliases
     app.router.add_get("/api/owners", handle_get_owners)
     app.router.add_post("/api/set-owner", handle_set_owner)
     app.router.add_post("/api/set-alias", handle_set_alias)
 
-    # Site config
-    app.router.add_get("/api/public/config", handle_get_config)
-    app.router.add_post("/api/admin/save-config", handle_save_config)
-
-    # ---------- RUN ----------
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
 
-    print(f"\033[92m[+] RBC LEVEL UP Dashboard running on http://{host}:{port}\033[0m")
-    print(f"\033[92m[+] Health check: http://{host}:{port}/healthz\033[0m")
-    print(f"\033[92m[+] Payment proxy: /api/pay/create  /api/pay/verify\033[0m")
+    print(f"\033[92m[+] Dashboard on http://{host}:{port}\033[0m")
+    print(f"\033[92m[+] Health: /healthz\033[0m")
+    print(f"\033[92m[+] Login:  /api/auth/login (server-side)\033[0m")
 
     return runner
 
 
-# ==================== STANDALONE TEST ====================
+# ==================== STANDALONE ====================
 
 if __name__ == "__main__":
     async def _test_main():
-        print("[TEST] Starting dashboard_server.py standalone...")
+        print("[TEST] dashboard_server.py standalone...")
         port = int(os.getenv("PORT", "20335"))
         runner = await start_web_dashboard(host="0.0.0.0", port=port)
         try:
@@ -786,6 +822,5 @@ if __name__ == "__main__":
                 await asyncio.sleep(3600)
         except (KeyboardInterrupt, asyncio.CancelledError):
             await runner.cleanup()
-            print("[TEST] Server stopped.")
 
     asyncio.run(_test_main())
