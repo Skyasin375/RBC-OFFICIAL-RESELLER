@@ -11,6 +11,7 @@ import os
 import uuid
 import itertools
 import base64
+import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -23,6 +24,11 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
 # ==================== ORIGINAL IMPORTS ====================
 from google_play_scraper import app as play_scraper
 from Crypto.Cipher import AES
@@ -34,12 +40,27 @@ import thunderFF_pb2
 # ==================== WEB DASHBOARD ====================
 from dashboard_server import bot_state, start_web_dashboard
 
-# ==================== CONFIGURATION ====================
-WEB_HOST = "0.0.0.0"
-WEB_PORT = 31178
-ACCOUNTS_FILE = "accounts.json"
-TOKEN_CACHE_FILE = "token_cache.json"
-DEVICES_FILE = "devices.json"
+# ==================== CONFIGURATION (Render-ready) ====================
+# Render injects PORT. Locally defaults to 31178.
+WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
+WEB_PORT = int(os.getenv("PORT", os.getenv("WEB_PORT", "31178")))
+
+# Public base URL — set this in Render env vars (e.g. https://rbc-level.onrender.com)
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+# Comma-separated allowed origins for CORS. "*" is fine for a public dashboard.
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+
+# Persistent data directory (Render disk mount). Defaults to current dir.
+DATA_DIR = os.getenv("DATA_DIR", ".")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    pass
+
+ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
+TOKEN_CACHE_FILE = os.path.join(DATA_DIR, "token_cache.json")
+DEVICES_FILE = os.path.join(DATA_DIR, "devices.json")
 TOKEN_CACHE_TTL = 1200
 
 START_MATCH_INTERVAL = 3.0
@@ -654,17 +675,6 @@ async def fetch_player_profile(uid, region, bearer_token):
     """
     Fetch real player profile (nickname, level, exp, likes, region) from
     GetPlayerPersonalShow.
-
-    Body: AES-CBC(payload) where payload = 0x08 <varint(uid)> 0x10 0x07
-    Header: Authorization: Bearer <bearer_token>
-
-    Response protobuf fields:
-      1  -> wrapper (contains 3=nickname, 6=level, 7=exp, 21=likes, 5=region)
-      3  -> nickname (top-level fallback)
-      6  -> level
-      7  -> exp
-      21 -> likes
-      5  -> region
     """
     try:
         uid_int = int(uid)
@@ -1956,11 +1966,7 @@ def _register_credentials(account_data: Dict):
 
 
 async def refresh_account_profile(account_data_or_uid: Any):
-    """
-    Refresh level/exp/likes/nickname/region from GetPlayerPersonalShow.
-    (GetLoginDataRes does NOT contain those fields — it only has nickname and
-    the functional / informational addresses.)
-    """
+    """Refresh level/exp/likes/nickname/region from GetPlayerPersonalShow."""
     try:
         if isinstance(account_data_or_uid, str):
             uid = str(account_data_or_uid)
@@ -2016,13 +2022,10 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
             likes=cached.get('likes', 0)
         )
         _register_credentials(cached)
-        # Link input UID → canonical bot account_id so the dashboard shows
-        # this account under the user who added it.
         try:
             bot_state.set_alias(str(uid), acc_id)
         except Exception:
             pass
-        # Refresh real profile (level / exp / likes) from GetPlayerPersonalShow
         try:
             profile = await fetch_player_profile(
                 acc_id,
@@ -2091,16 +2094,11 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
 
         acc_id = str(majorlogin_response.account_id)
 
-        # Link the user's input UID → the bot's real account_id.
-        # This is what makes the dashboard show the real account under the user
-        # who added it, instead of being stuck on the input UID card.
         try:
             bot_state.set_alias(str(uid), acc_id)
         except Exception:
             pass
 
-        # GetLoginDataRes ONLY contains nickname + addresses.
-        # Real level / exp / likes / region come from GetPlayerPersonalShow.
         nickname = res_proto.nickname or f"Player_{acc_id}"
         region = majorlogin_response.region or "BD"
         level = 1
@@ -2112,7 +2110,6 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
             level=level, exp=exp, likes=likes
         )
 
-        # Fetch real profile data from GetPlayerPersonalShow
         profile = await fetch_player_profile(
             acc_id, region, majorlogin_response.token
         )
@@ -2174,12 +2171,10 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
             likes=cached.get('likes', 0)
         )
         _register_credentials(cached)
-        # Link token prefix → canonical bot account_id
         try:
             bot_state.set_alias(cache_key, acc_id)
         except Exception:
             pass
-        # Refresh real profile
         try:
             profile = await fetch_player_profile(
                 acc_id,
@@ -2255,13 +2250,11 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
         res_proto, dict_res = getlogin_result
         acc_id = str(majorlogin_response.account_id)
 
-        # Link token prefix → canonical bot account_id
         try:
             bot_state.set_alias(cache_key, acc_id)
         except Exception:
             pass
 
-        # GetLoginDataRes has no level/exp/likes — use GetPlayerPersonalShow
         nickname = res_proto.nickname or f"Player_{acc_id}"
         region = majorlogin_response.region or "BD"
         level = 1
@@ -2355,11 +2348,6 @@ async def run_account_worker(account_data: Dict, label: str):
         )
 
         async def exp_refresher():
-            """
-            Refresh real player profile (level / exp / likes) every 45s from
-            GetPlayerPersonalShow. GetLoginDataRes is not used here because
-            it doesn't contain those fields.
-            """
             while True:
                 await asyncio.sleep(PROFILE_REFRESH_INTERVAL)
                 try:
@@ -2551,11 +2539,11 @@ def load_accounts():
     return accounts
 
 
-# ==================== MAIN ====================
+# ==================== MAIN (Render-ready) ====================
 async def main():
     print_colored("=" * 60, Colors.CYAN)
-    print_colored("    TEAM 84FF - FreeFire Level Up Bot (FIXED OB55)", Colors.GREEN)
-    print_colored("   BR_AUTH_ABNORMAL_GAME_CLIENT Fix Applied", Colors.WHITE)
+    print_colored("    TEAM 84FF - FreeFire Level Up Bot (RENDER BUILD)", Colors.GREEN)
+    print_colored(f"   Host: {WEB_HOST} | Port: {WEB_PORT} | Data: {DATA_DIR}", Colors.WHITE)
     print_colored("=" * 60, Colors.CYAN)
 
     try:
@@ -2564,9 +2552,12 @@ async def main():
     except Exception:
         pass
 
+    # -------- Start Web Dashboard FIRST (Render health check needs this) --------
     try:
         await start_web_dashboard(host=WEB_HOST, port=WEB_PORT)
-        print_success(f"Web Dashboard live at http://localhost:{WEB_PORT}")
+        if PUBLIC_BASE_URL:
+            print_success(f"Public URL: {PUBLIC_BASE_URL}")
+        print_success(f"Web Dashboard live at http://{WEB_HOST}:{WEB_PORT}")
     except Exception as e:
         print_error(f"Could not start web dashboard: {e}")
 
@@ -2591,7 +2582,10 @@ async def main():
 
     if not accounts:
         print_warning(f"No accounts found in {ACCOUNTS_FILE}! Add accounts from Web Dashboard.")
-        print_warning(f"Open: http://localhost:{WEB_PORT}")
+        if PUBLIC_BASE_URL:
+            print_warning(f"Open: {PUBLIC_BASE_URL}")
+        else:
+            print_warning(f"Open: http://localhost:{WEB_PORT}")
 
     for acc in accounts:
         if "token" in acc and acc["token"]:
@@ -2605,7 +2599,7 @@ async def main():
     try:
         while True:
             await asyncio.sleep(1)
-    except (KeyboardInterrupt, asyncio.CancelledError):
+    except (KeyboardInterrupt, asyncio.CancelledError, SystemExit):
         print_warning("\n[STOP] Shutting down all accounts...")
         for t in list(bot_state.account_workers.values()):
             t.cancel()
