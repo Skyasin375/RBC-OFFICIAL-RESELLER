@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: rbc-level
+    runtime: python
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION
+        value: python
+      - key: WEB_HOST
+        value: 0.0.0.0
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      - key: PAY_API_BASE
+        value: "https://fampaygateway.site/api"
+      - key: PAY_API_KEY
+        value: "FAM_7E06068D658196F192A94D47DF9C46500389DCBB"
+      # Optional: set after first deploy
+      # - key: PUBLIC_BASE_URL
+      #   value: https://rbc-level.onrender.com
