@@ -799,8 +799,11 @@ body.hasann .nav{top:54px}
 
 <script>
 /* ============================================================
-   RBC LEVEL — Render-ready frontend
-   Payment now goes through /api/pay/* (server-side proxy).
+   RBC LEVEL — Render-ready frontend (FIXED v2)
+   - Server-side login (multi-device)
+   - Server-side credential creation
+   - Pending timeout + retry
+   - Safe EXP handling
    ============================================================ */
 const API_BASE = '/api';
 const LS_SESSION='rbc_session_v2';
@@ -864,7 +867,7 @@ async function api(path,opts={}){
   }catch(e){return{ok:false,status:0,data:null,error:e.message}}
 }
 
-/* ================= PAYMENT (goes through backend proxy) ================= */
+/* ================= PAYMENT ================= */
 async function payCreateOrder(amount){
   try{
     const res = await fetch(`/api/pay/create?amount=${encodeURIComponent(amount)}`);
@@ -967,9 +970,9 @@ function gotoPage(name){
 function openPricing(){gotoPage('pricing')}
 function openDashboard(){gotoPage('dash')}
 
-/* ============ LOGIN ============ */
+/* ============ LOGIN (server-side, multi-device) ============ */
 let LOGIN_BUSY=false;
-function handleLogin(){
+async function handleLogin(){
   if(LOGIN_BUSY)return;LOGIN_BUSY=true;
   const btn=$('loginSubmitBtn');if(btn){btn.disabled=true;btn.style.opacity='.72'}
   const finish=()=>{LOGIN_BUSY=false;if(btn){btn.disabled=false;btn.style.opacity=''}};
@@ -977,23 +980,55 @@ function handleLogin(){
   const password=$('loginPassword').value;
   if(!email||!password){toast('Enter email and password','warn');finish();return}
 
+  // Admin shortcut (local check)
   if(email===ADMIN_EMAIL.toLowerCase()&&password===ADMIN_PASSWORD){
     SESSION={role:'admin',email:ADMIN_EMAIL,user:null,credential:null,verifiedAt:Date.now()};
     saveSession();toast('Admin access granted','ok');
-    startPolling();renderDashboard();finish();return;
+    hideLogin();startPolling();renderDashboard();finish();return;
   }
-  const users=loadUsers();
-  const user=users.find(u=>u.email.toLowerCase()===email&&u.password===password);
-  if(!user){toast('Invalid email or password','err');finish();return}
 
-  const creds=loadCredentials();
-  const cred=creds.find(c=>c.email===user.email);
-  if(!cred||cred.revoked||(cred.expiresAt&&cred.expiresAt>0&&Date.now()>cred.expiresAt)){
-    toast('Credentials invalid or expired','err');finish();return;
+  // Server-side login
+  try{
+    const res=await fetch('/api/auth/login',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email,password})
+    });
+    const data=await res.json();
+
+    if(!res.ok||data.status!=='ok'){
+      toast(data.error||'Invalid email or password','err');
+      finish();return;
+    }
+
+    // Mirror to localStorage for fallback
+    const users=loadUsers();
+    const existingUser=users.find(u=>u.email===data.email);
+    if(existingUser){existingUser.password=password}
+    else{users.push({name:'User',email:data.email,password,createdAt:Date.now()})}
+    saveUsers(users);
+
+    if(data.role==='admin'){
+      SESSION={role:'admin',email:data.email,user:null,credential:null,verifiedAt:Date.now()};
+    }else{
+      const creds=loadCredentials();
+      const idx=creds.findIndex(c=>c.email===data.email);
+      if(idx>=0){creds[idx]={...creds[idx],...data.credential}}
+      else{creds.unshift(data.credential)}
+      saveCredentials(creds);
+      SESSION={role:'user',email:data.email,user:data.user,credential:{...data.credential},verifiedAt:Date.now()};
+    }
+
+    saveSession();
+    toast('Login successful','ok');
+    hideLogin();
+    startPolling();
+    renderDashboard();
+  }catch(e){
+    toast('Login error: '+e.message,'err');
+  }finally{
+    finish();
   }
-  SESSION={role:'user',email:user.email,user,credential:{...cred},verifiedAt:Date.now()};
-  saveSession();toast('Login successful','ok');
-  startPolling();renderDashboard();finish();
 }
 
 /* ============ PLANS ============ */
@@ -1054,7 +1089,7 @@ async function pollPaymentStatus(orderId){
       clearInterval(PAYMENT_POLL);if(PAYMENT_TIMER_INT)clearInterval(PAYMENT_TIMER_INT);
       closeModal('paymentModal');toast('Payment successful!','ok');
       const plan=CURRENT_ORDER?.plan;
-      if(plan)autoCreateCreds(plan,orderId);
+      if(plan)await autoCreateCreds(plan,orderId);
       CURRENT_ORDER=null;
     }
   }catch(e){}
@@ -1066,19 +1101,41 @@ async function manualVerifyPayment(orderId){
       clearInterval(PAYMENT_POLL);if(PAYMENT_TIMER_INT)clearInterval(PAYMENT_TIMER_INT);
       closeModal('paymentModal');toast('Payment confirmed!','ok');
       const plan=CURRENT_ORDER?.plan;
-      if(plan)autoCreateCreds(plan,orderId);
+      if(plan)await autoCreateCreds(plan,orderId);
       CURRENT_ORDER=null;
     }else toast('Not detected yet','warn');
   }catch(e){toast('Verify failed: '+e.message,'err')}
 }
-function autoCreateCreds(plan,orderId){
+
+/* ✅ SERVER-SIDE credential creation after payment */
+async function autoCreateCreds(plan,orderId){
   const email=genEmail(),password=genPassword(),now=Date.now();
   const expiresAt=now+plan.days*86400000;
+
+  let serverOk=false;
+  try{
+    const res=await fetch('/api/user/create',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        email,password,
+        slots:plan.slots,
+        days:plan.days,
+        label:`AUTO-${plan.days}D`
+      })
+    });
+    const data=await res.json();
+    serverOk=data.status==='ok';
+  }catch(e){console.error('Server push failed:',e)}
+
+  // Local mirror
   const creds=loadCredentials();
   creds.unshift({email,password,slots:plan.slots,label:`AUTO-${plan.days}D`,revoked:false,created_at:now,expiresAt,days:plan.days});
   saveCredentials(creds);
   const users=loadUsers();users.push({name:'User',email,password,createdAt:now});saveUsers(users);
-  alert(`✅ Payment Successful!\n\nEmail: ${email}\nPassword: ${password}\n\nValid ${plan.days} day(s) · ${plan.slots} slots`);
+
+  const note=serverOk?'':' (⚠️ Server save fail — dusre device se login nahi hoga)';
+  alert(`✅ Payment Successful!\n\nEmail: ${email}\nPassword: ${password}\n\nValid ${plan.days} day(s) · ${plan.slots} slots${note}`);
   renderDashboard();
 }
 
@@ -1118,7 +1175,6 @@ function getMyAccounts(){
 
 function renderUserStats(){
   const accs=getMyAccounts();
-  const mine=myCanonicalSet();
   const slots=SESSION.credential.slots||0;
   const usedCanonical=new Set();
   for(const a of accs)usedCanonical.add(String(a.uid));
@@ -1132,7 +1188,7 @@ function renderUserStats(){
   $('sUptime').textContent=fmtUptime(Date.now()-START_TIME);
 
   let filtered=[...accs,...pendingForMyKey()];
-  if(currentFilter==='active')filtered=filtered.filter(a=>!a.paused&&a.status!=='ERROR'&&!a._pending);
+  if(currentFilter==='active')filtered=filtered.filter(a=>!a.paused&&a.status!=='ERROR'&&!a._pending&&!a._error);
   else if(currentFilter==='paused')filtered=filtered.filter(a=>a.paused);
   else if(currentFilter==='error')filtered=filtered.filter(a=>a.status==='ERROR'||a._error);
 
@@ -1146,15 +1202,25 @@ function setFilter(f){
   renderUserStats();
 }
 
+/* ✅ PENDING with timeout detection */
 function pendingForMyKey(){
   const myKey=SESSION.credential?.email;
-  return Object.entries(PENDING).filter(([uid,meta])=>meta.owner===myKey)
-    .map(([uid,meta])=>({
-      uid, _pending:true, _error:meta.error,
-      nickname:null,region:null,level:null,current_exp:null,
-      gained_exp:null,matches_played:null,active_matches:null,
-      last_match_time:null,status:'SEARCHING'
-    }));
+  if(!myKey)return[];
+  return Object.entries(PENDING)
+    .filter(([uid,meta])=>meta.owner===myKey)
+    .map(([uid,meta])=>{
+      const age=Date.now()-(meta.startedAt||Date.now());
+      const timedOut=age>90000;
+      return {
+        uid,
+        _pending:!timedOut,
+        _error:timedOut?'Sync timeout — check UID/password':(meta.error||null),
+        nickname:null,region:null,level:null,current_exp:null,
+        gained_exp:null,matches_played:null,active_matches:null,
+        last_match_time:null,
+        status:timedOut?'ERROR':'SEARCHING'
+      };
+    });
 }
 
 function levelProgressInfo(expValue,levelValue){
@@ -1202,6 +1268,7 @@ function sparklineSvg(uid){
   }).join('')}</div>`;
 }
 
+/* ✅ Pending + Error cards */
 function cardHtml(a){
   const uid=showUid(a.uid);
   const nick=a.nickname||`Player_${String(a.uid).slice(-4)}`;
@@ -1214,7 +1281,7 @@ function cardHtml(a){
   else if(a.paused||st==='PAUSED')cls='paused';
   else if(st==='OFFLINE')cls='offline';
 
-  const statusLabel=a.paused?'PAUSED':(a._pending?'SEARCHING':st.replace('_',' '));
+  const statusLabel=a.paused?'PAUSED':(a._pending?'SEARCHING':(a._error?'ERROR':st.replace('_',' ')));
   const initial=(nick||uid).charAt(0).toUpperCase();
 
   const level=Number(a.level)||0;
@@ -1229,6 +1296,7 @@ function cardHtml(a){
   const etaStr=rate.eta!=null?(rate.eta>60?`${Math.round(rate.eta/60)}h ${rate.eta%60}m`:`${rate.eta}m`):'—';
   const lastMatch=a.last_match_time||'—';
 
+  // Pending card
   if(a._pending){
     return `<article class="account pending" data-uid="${esc(uid)}">
       <div class="top-row">
@@ -1250,6 +1318,29 @@ function cardHtml(a){
     </article>`;
   }
 
+  // Error card (timeout)
+  if(a._error){
+    return `<article class="account pending" data-uid="${esc(uid)}">
+      <div class="top-row">
+        <div class="identity">
+          <div class="avatar" style="background:rgba(255,84,112,.12);color:#ff8099"><i class="fa-solid fa-triangle-exclamation"></i></div>
+          <div class="meta">
+            <div class="tag-row">${regionTag(region)}<span class="tag br">ERROR</span></div>
+            <strong>Sync failed</strong>
+            <div class="uid-line">UID ${esc(uid)}</div>
+            <div class="alias-note" style="color:#ff8099">${esc(a._error)}</div>
+          </div>
+        </div>
+        <span class="status error">ERROR</span>
+      </div>
+      <div class="actions" style="grid-template-columns:1fr 1fr">
+        <button class="btn-info" onclick="retryPending('${esc(uid)}')"><i class="fa-solid fa-rotate"></i> Retry</button>
+        <button class="btn-stop" onclick="cancelPending('${esc(uid)}')"><i class="fa-solid fa-xmark"></i> Cancel</button>
+      </div>
+    </article>`;
+  }
+
+  // Normal card
   return `<article class="account" data-uid="${esc(uid)}">
     <div class="top-row">
       <div class="identity">
@@ -1372,7 +1463,7 @@ async function submitAddAccount(){
     await refreshStats();
     const canon=SERVER_ALIASES[requestKey];
     const found=canon?ACCOUNTS_CACHE[String(canon)]:ACCOUNTS_CACHE[String(pendingUid)];
-    if(found||tries>=40){
+    if(found||tries>=60){
       clearInterval(t);
       if(found){
         delete PENDING[pendingUid];
@@ -1380,11 +1471,32 @@ async function submitAddAccount(){
         if(canon){owners2[String(canon)]=SESSION.credential.email;saveOwners(owners2);}
         toast('Account verified — real profile loaded','ok');
       }else{
-        if(PENDING[pendingUid])PENDING[pendingUid].error='Player info timeout';
+        if(PENDING[pendingUid])PENDING[pendingUid].error='Player info timeout — check UID/password';
+        toast('Sync timeout. Retry ya cancel karo.','err');
       }
       renderDashboard();
     }
   },1500);
+}
+
+/* ✅ Retry / Cancel pending */
+async function retryPending(uid){
+  const meta=PENDING[uid];
+  if(!meta){toast('Pending entry not found','warn');return}
+  delete PENDING[uid];
+  toast('Retrying...','info');
+  await api('/account/refresh',{method:'POST',body:JSON.stringify({uid})});
+  PENDING[uid]={startedAt:Date.now(),owner:SESSION.credential.email,requestKey:meta.requestKey||uid};
+  renderDashboard();
+}
+async function cancelPending(uid){
+  if(!confirm(`Cancel pending account ${uid}?`))return;
+  delete PENDING[uid];
+  const o=loadOwners();
+  if(o[uid]){delete o[uid];saveOwners(o)}
+  try{await api('/account/remove',{method:'POST',body:JSON.stringify({uid})})}catch(_){}
+  toast('Pending account removed','warn');
+  renderDashboard();
 }
 
 async function refreshAccount(uid){
@@ -1420,7 +1532,6 @@ function showInfo(uid){
   const a=Object.values(ACCOUNTS_CACHE).find(x=>String(x.uid)===String(uid));
   if(!a){toast('Account not found','err');return}
   const rate=getExpRate(String(uid));
-  const prog=levelProgressInfo(a.current_exp||0,a.level||1);
   $('infoContent').innerHTML=`
     <div><b style="color:var(--cyan)">Nickname:</b> ${esc(a.nickname||'—')}</div>
     <div><b style="color:var(--cyan)">UID:</b> ${esc(a.uid)}</div>
@@ -1481,21 +1592,38 @@ function pickSlots(n){
   n=Math.max(1,Math.min(200,parseInt(n)||1));PICKED_SLOTS=n;
   document.querySelectorAll('.slot-btn').forEach(b=>b.classList.toggle('active',parseInt(b.dataset.slots)===n));
 }
-function generateCredentials(){
+
+/* ✅ Server-side credential generation */
+async function generateCredentials(){
   const slots=PICKED_SLOTS;
   const label=$('credLabel').value.trim()||'UNNAMED';
   const days=parseInt($('credDuration').value)||0;
   const email=genEmail(),password=genPassword(),now=Date.now();
   const expiresAt=days>0?now+days*86400000:0;
+
+  let serverOk=false;
+  try{
+    const res=await fetch('/api/user/create',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email,password,slots,days,label})
+    });
+    const data=await res.json();
+    serverOk=data.status==='ok';
+  }catch(e){console.error('Server push failed:',e)}
+
   const creds=loadCredentials();
   creds.unshift({email,password,slots,label,revoked:false,created_at:now,expiresAt,days});
   saveCredentials(creds);
   const users=loadUsers();users.push({name:'User',email,password,createdAt:now});saveUsers(users);
-  alert(`✅ Credentials Generated!\n\nEmail: ${email}\nPassword: ${password}\n\nSlots: ${slots} · Days: ${days||'∞'}`);
-  toast('Credentials saved','ok');
+
+  const note=serverOk?'':' (⚠️ Server save fail — dusre device se login nahi hoga)';
+  alert(`✅ Credentials Generated!\n\nEmail: ${email}\nPassword: ${password}\n\nSlots: ${slots} · Days: ${days||'∞'}${note}`);
+  toast(serverOk?'Credentials saved (server + local)':'Saved locally only','ok');
   closeModal('credGenModal');$('credLabel').value='';
   renderCreds();renderDashboard();
 }
+
 function renderCreds(){
   const box=$('credsList');if(!box)return;
   const q=($('credSearch').value||'').toLowerCase();
@@ -1717,7 +1845,7 @@ async function saveCfg(patch){
   CFG={...CFG,...patch};try{localStorage.setItem(LS_CFG,JSON.stringify(CFG))}catch(_){}
   try{const r=await fetch('/api/admin/save-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(CFG)});const d=await r.json();
     if(d.status==='ok')toast('Saved for all users','ok');else throw 0}
-  catch(_){toast('Saved on this device only — add /api/admin/save-config to backend','warn')}
+  catch(_){toast('Saved on this device only','warn')}
   applyCfg();
 }
 function applyCfg(){
@@ -1746,7 +1874,7 @@ buyPlan=function(i){if(CFG.sales_open===false){toast('Sales are paused right now
 /* ===== Bot card renderer ===== */
 const _ch=cardHtml;
 cardHtml=function(a){
-  if(a._pending)return _ch(a);
+  if(a._pending||a._error)return _ch(a);
   const uid=String(a.uid),nick=a.nickname||('Player_'+uid.slice(-4)),st=(a.status||'ONLINE').toUpperCase();
   const cur=Number(a.current_exp)||0,lv=Number(a.level)||1,p=levelProgressInfo(cur,lv),r=getExpRate(uid);
   MAXR[uid]=Math.max(MAXR[uid]||0,Math.round(r.npm));
@@ -1964,7 +2092,7 @@ const _lt=loadTelegramSettings;loadTelegramSettings=async function(){await _lt()
       renderDashboard();
 
       let resolved=false;
-      for(let attempt=1;attempt<=40;attempt++){
+      for(let attempt=1;attempt<=60;attempt++){
         await refreshStats();
         const aliasNow=SERVER_ALIASES[requestKey];
         const target=aliasNow?ACCOUNTS_CACHE[String(aliasNow)]:null;
@@ -1990,9 +2118,9 @@ const _lt=loadTelegramSettings;loadTelegramSettings=async function(){await _lt()
         await sleep(1500);
       }
       if(!resolved){
-        if(PENDING[requestKey])PENDING[requestKey].error='Player data timeout';
+        if(PENDING[requestKey])PENDING[requestKey].error='Player data timeout — check UID/password';
         renderDashboard();
-        toast('Sync is taking longer than expected. Keep the dashboard open; it will continue polling.','warn');
+        toast('Sync timeout — Retry ya Cancel use karo','err');
       }
     }catch(e){
       toast('Sync error: '+(e.message||'request failed'),'err');
@@ -2029,7 +2157,8 @@ const I={
 'satellite-dish':P('M4 10a8 8 0 018 8M4 4a14 14 0 0116 16')+C(5,19,1.5),'screwdriver-wrench':P('M4 20l10-10M14 4a5 5 0 006 6l-3 3-6-6z'),
 'shield-halved':P('M12 2l8 3v6c0 5-4 9-8 11-4-2-8-6-8-11V5zM12 2v20'),'stop':R(6,6,12,12),'telegram':P('M21 4L3 11l6 2 2 6 3-4 5 4z'),
 'terminal':P('M4 17l6-5-6-5M12 19h8'),'trash':P('M3 6h18M8 6V4h8v2M6 6l1 15h10l1-15'),'user-plus':C(9,8,4)+P('M2 21c0-4 3-6 7-6M19 8v6M16 11h6'),
-'users':C(9,8,3.5)+P('M2 21c0-4 3-6 7-6s7 2 7 6M17 4a3.5 3.5 0 010 7M22 20c0-3-2-5-4-5.5'),'wand-magic-sparkles':P('M4 20L16 8M14 6l4 4M19 3v4M17 5h4M6 4v3M4.5 5.5h3')};
+'users':C(9,8,3.5)+P('M2 21c0-4 3-6 7-6s7 2 7 6M17 4a3.5 3.5 0 010 7M22 20c0-3-2-5-4-5.5'),'wand-magic-sparkles':P('M4 20L16 8M14 6l4 4M19 3v4M17 5h4M6 4v3M4.5 5.5h3'),
+'triangle-exclamation':P('M12 3L2 20h20L12 3zM12 9v5M12 17.5v.01')};
 function up(root){(root.querySelectorAll?root:document).querySelectorAll('i[class*="fa-"]:not([data-s])').forEach(el=>{
   const n=[...el.classList].map(c=>c.replace(/^fa-/,'')).find(c=>I[c]);if(!n)return;
   el.dataset.s=1;el.innerHTML=`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${I[n]}</svg>`})}
