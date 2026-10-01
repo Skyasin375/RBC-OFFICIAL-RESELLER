@@ -1,18 +1,14 @@
 # -*- coding: utf-8 -*-
-# ==================== STANDARD IMPORTS ====================
+# ==================== UNBUFFERED STDOUT (Render fix) ====================
 import sys
-import asyncio
-import httpx
-import random
-import json
-import socket
-import struct
-import time
 import os
-import uuid
-import itertools
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+os.environ['PYTHONUNBUFFERED'] = '1'
+os.environ.setdefault('PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION', 'python')
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 if sys.platform == "win32":
     try:
@@ -22,6 +18,19 @@ if sys.platform == "win32":
             sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
         pass
+
+# ==================== STANDARD IMPORTS ====================
+import asyncio
+import httpx
+import random
+import json
+import socket
+import struct
+import time
+import uuid
+import itertools
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Any
 
 # ==================== ORIGINAL IMPORTS ====================
 from google_play_scraper import app as play_scraper
@@ -35,12 +44,19 @@ import StartMatch_pb2
 # ==================== WEB DASHBOARD ====================
 from dashboard_server import bot_state, start_web_dashboard
 
-# ==================== CONFIGURATION ====================
-WEB_HOST = "0.0.0.0"
-WEB_PORT = 20331
-ACCOUNTS_FILE = "accounts.json"
-TOKEN_CACHE_FILE = "token_cache.json"
-DEVICES_FILE = "devices.json"
+# ==================== CONFIGURATION (Render-aware) ====================
+WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
+WEB_PORT = int(os.getenv("PORT", os.getenv("WEB_PORT", "20331")))
+
+DATA_DIR = os.getenv("DATA_DIR", ".")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    pass
+
+ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
+TOKEN_CACHE_FILE = os.path.join(DATA_DIR, "token_cache.json")
+DEVICES_FILE = os.path.join(DATA_DIR, "devices.json")
 TOKEN_CACHE_TTL = 1200
 
 START_MATCH_INTERVAL = 3.0
@@ -80,6 +96,26 @@ def _generate_new_device() -> dict:
         "processor_details": f"ARM64 FP ASIMD AES VMH | {random.randint(2200, 3200)} | {random.randint(6, 12)}",
         "client_ip": f"{random.randint(103, 223)}.{random.randint(10, 250)}.{random.randint(10, 250)}.{random.randint(10, 250)}"
     }
+
+
+def load_accounts() -> List[dict]:
+    if not os.path.exists(ACCOUNTS_FILE):
+        return []
+    try:
+        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_accounts(accounts: List[dict]):
+    try:
+        os.makedirs(os.path.dirname(ACCOUNTS_FILE) or ".", exist_ok=True)
+        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(accounts, f, indent=2)
+    except Exception as e:
+        print_error(f"[SAVE_ACCOUNTS] {e}")
 
 
 def sync_devices_with_accounts() -> dict:
@@ -374,10 +410,10 @@ class Colors:
 
 def print_colored(text, color=Colors.WHITE):
     try:
-        print(f"{color}{text}{Colors.ENDC}")
+        print(f"{color}{text}{Colors.ENDC}", flush=True)
     except Exception:
         try:
-            print(f"{color}{text.encode('ascii', errors='replace').decode('ascii')}{Colors.ENDC}")
+            print(f"{color}{text.encode('ascii', errors='replace').decode('ascii')}{Colors.ENDC}", flush=True)
         except Exception:
             pass
 
@@ -586,6 +622,7 @@ async def version_config():
         remote_version = data.get("remote_version")
         latest_release_version = data.get("latest_release_version")
         if not server_url or not remote_version or not latest_release_version:
+            print_error(f"[VERCONFIG] Missing fields in response")
             return None
         return latest_release_version, remote_version, server_url
     except Exception as e:
@@ -734,7 +771,7 @@ async def send_majorlogin(data, release_version, server_url):
         req_headers["ReleaseVersion"] = str(release_version)
         response = await client.post(url, headers=req_headers, data=data)
         if response.status_code != 200:
-            print_error(f"[MAJORLOGIN] Server rejected payload with status {response.status_code}")
+            print_error(f"[MAJORLOGIN] HTTP {response.status_code}")
             return None
         response_content = response.content
         if len(response_content) < 40:
@@ -783,6 +820,7 @@ async def send_getlogin(data, base_url, token, release_version):
         req_headers['Host'] = "clientbp.ppmainecoonghj.com"
         response = await client.post(url, headers=req_headers, data=data)
         if response.status_code != 200:
+            print_warning(f"[GETLOGIN] HTTP {response.status_code}")
             return None
         response_content = response.content
 
@@ -814,7 +852,8 @@ async def send_getlogin(data, base_url, token, release_version):
             pass
 
         return res_proto, dict_res
-    except Exception:
+    except Exception as e:
+        print_warning(f"[GETLOGIN] Error: {e}")
         return None
 
 
@@ -1481,8 +1520,6 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     last_start_time = 0.0
     uid_str = str(account_id)
 
-    consecutive_parse_failures = 0
-
     current_token = starter_packet
     current_key = key
     current_iv = iv
@@ -1717,8 +1754,6 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                 )
                                 play_matches.append(new_match)
 
-                                consecutive_parse_failures = 0
-
                                 async def drain_gateway_reader():
                                     while not new_match.done():
                                         try:
@@ -1745,7 +1780,6 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
                                 play_matches[:] = [m for m in play_matches if not m.done()]
 
-                                # 🔥 AUTO BR → LW SWITCH CHECK
                                 try:
                                     await refresh_account_profile(effective_acc_id)
                                 except Exception:
@@ -1785,11 +1819,11 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                 break
 
                             else:
-                                print_info(f"[FUNCTIONAL] Config packet received ({packet_length}B), maintaining queue...")
+                                print_info(f"[FUNCTIONAL] Config packet ({packet_length}B), maintaining queue...")
                                 continue
 
                         except Exception as e:
-                            print_warning(f"[FUNCTIONAL] Match packet notice: {e}, maintaining queue...")
+                            print_warning(f"[FUNCTIONAL] Match packet notice: {e}")
                             continue
 
                     if 30 <= packet_length <= 40:
@@ -1943,10 +1977,7 @@ def _register_credentials(account_data: Dict):
 
 
 async def refresh_account_profile(account_data_or_uid: Any):
-    """
-    Fetches fresh level/exp/likes/nickname from GetLoginData.
-    Updates bot_state so BR → LW switching works live.
-    """
+    """Fetches fresh level/exp/likes/nickname. Updates bot_state so mode switch works."""
     try:
         if isinstance(account_data_or_uid, str):
             uid = str(account_data_or_uid)
@@ -2026,10 +2057,7 @@ async def refresh_account_profile(account_data_or_uid: Any):
             pass
 
     except Exception as e:
-        try:
-            print_error(f"[REFRESH] {e}")
-        except Exception:
-            pass
+        print_error(f"[REFRESH] {e}")
 
 
 async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
@@ -2046,7 +2074,6 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
             auth_uid=str(uid)
         )
         _register_credentials(cached)
-        # Refresh after cache hit (keeps level fresh)
         try:
             await refresh_account_profile(acc_id)
         except Exception:
@@ -2064,20 +2091,70 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
 
             tokengrant_response = await get_access_token(uid, password)
             if tokengrant_response is None:
+                print_error(f"[LOGIN] OAuth failed for UID {uid}")
                 return None
             open_id, access_token, platform = tokengrant_response
+            print_success(f"[LOGIN] OAuth OK: open_id={open_id[:12]}... platform={platform}")
 
             device_info = get_device_for_account(uid)
 
             login_payload_data = await build_majorlogin_payload(open_id, access_token, platform, client_version, device_info)
             if login_payload_data is None:
                 return None
+
             majorlogin_response = await send_majorlogin(login_payload_data, release_version, server_url)
             if majorlogin_response is None:
                 return None
-            getlogin_result = await send_getlogin(login_payload_data, majorlogin_response.url, majorlogin_response.token, release_version)
+
+            print_success(f"[LOGIN] MajorLogin OK: account_id={majorlogin_response.account_id} | region={majorlogin_response.region}")
+
+            acc_id_early = str(majorlogin_response.account_id)
+
+            getlogin_result = await send_getlogin(
+                login_payload_data,
+                majorlogin_response.url,
+                majorlogin_response.token,
+                release_version
+            )
+
             if getlogin_result is None:
-                return None
+                # 🔥 Fallback: register with defaults so dashboard still shows the account
+                print_warning(f"[LOGIN] GetLoginData failed for {acc_id_early} — registering with defaults")
+                bot_state.register_account(
+                    uid=acc_id_early,
+                    nickname=f"Player_{acc_id_early[:6]}",
+                    region=majorlogin_response.region or "BD",
+                    level=1, exp=0, likes=0,
+                    auth_uid=str(uid)
+                )
+                account_data = {
+                    'account_id': majorlogin_response.account_id,
+                    'nickname': f"Player_{acc_id_early[:6]}",
+                    'region': majorlogin_response.region or "BD",
+                    'level': 1,
+                    'exp': 0,
+                    'likes': 0,
+                    'open_id': open_id,
+                    'access_token': access_token,
+                    'platform': str(platform),
+                    'token': majorlogin_response.token,
+                    'server_time': majorlogin_response.server_time,
+                    'aes_ak': majorlogin_response.aes_ak,
+                    'iv_i': majorlogin_response.iv_i,
+                    'functional_addrs': None,
+                    'informational_addrs': None,
+                    'release_version': release_version,
+                    'client_version': client_version,
+                    'server_url': majorlogin_response.url,
+                    'login_payload_data': login_payload_data,
+                    'auth_type': 'guest',
+                    'auth_uid': uid,
+                    'auth_password': password
+                }
+                _register_credentials(account_data)
+                cache_set(uid, account_data)
+                return account_data
+
             res_proto, dict_res = getlogin_result
 
         acc_id = str(majorlogin_response.account_id)
@@ -2094,7 +2171,6 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
 
         mode_now = "BR" if level < MODE_SWITCH_LEVEL else "LONE_WOLF"
 
-        # 🔥 Register account IMMEDIATELY so dashboard shows it
         bot_state.register_account(
             uid=acc_id, nickname=nickname, region=region,
             level=level, exp=exp, likes=likes, auth_uid=str(uid)
@@ -2130,7 +2206,6 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
         _register_credentials(account_data)
         cache_set(uid, account_data)
 
-        # 🔥 Refresh profile right after login (fetch live level/exp)
         try:
             await refresh_account_profile(acc_id)
         except Exception as e:
@@ -2279,6 +2354,17 @@ async def run_account_worker(account_data: Dict, label: str):
     exp_task = None
     try:
         reg = account_data.get('region', 'BD')
+
+        # Only start workers if functional_addrs exists
+        if not account_data.get('functional_addrs'):
+            print_warning(f"[WORKER] No functional_addrs for {acc_id} — skipping match worker")
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    await refresh_account_profile(acc_id)
+                except Exception:
+                    pass
+
         tcp_packet_online = await build_tcp_startup_packet(
             account_data['account_id'],
             account_data['token'],
@@ -2299,16 +2385,17 @@ async def run_account_worker(account_data: Dict, label: str):
             typ='ChaT'
         )
 
-        informational_task = asyncio.create_task(
-            informational(
-                account_data['informational_addrs'],
-                tcp_packet_chat,
-                account_data['aes_ak'],
-                account_data['iv_i'],
-                region=reg,
-                account_id=acc_id
+        if account_data.get('informational_addrs'):
+            informational_task = asyncio.create_task(
+                informational(
+                    account_data['informational_addrs'],
+                    tcp_packet_chat,
+                    account_data['aes_ak'],
+                    account_data['iv_i'],
+                    region=reg,
+                    account_id=acc_id
+                )
             )
-        )
 
         async def exp_refresher():
             while True:
@@ -2417,30 +2504,22 @@ async def account_loop_token(token: str):
             await asyncio.sleep(8)
 
 
-# ==================== ACCOUNTS LOADER ====================
-def load_accounts():
-    accounts = []
-    if os.path.exists(ACCOUNTS_FILE):
-        try:
-            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    accounts = data
-        except Exception as e:
-            print_error(f"Could not load {ACCOUNTS_FILE}: {e}")
-
-    if not accounts and FALLBACK_UID and FALLBACK_PASSWORD:
-        accounts.append({"uid": FALLBACK_UID, "password": FALLBACK_PASSWORD})
-
-    return accounts
-
-
 # ==================== MAIN ====================
 async def main():
+    # 🔥 STARTUP DIAGNOSTICS (Render logs me turant dikhega)
+    print("=" * 60, flush=True)
+    print("RBC LEVEL BOT — Starting up...", flush=True)
+    print(f"WEB_HOST={WEB_HOST}  WEB_PORT={WEB_PORT}", flush=True)
+    print(f"DATA_DIR={DATA_DIR}", flush=True)
+    print(f"ACCOUNTS_FILE={ACCOUNTS_FILE}", flush=True)
+    print(f"accounts.json exists={os.path.exists(ACCOUNTS_FILE)}", flush=True)
+    print(f"PROTOCOL_BUFFERS={os.getenv('PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION', 'NOT SET')}", flush=True)
+    print("=" * 60, flush=True)
+
     print_colored("╔════════════════════════════════════════════════════════════╗", Colors.CYAN)
     print_colored("║     ⚡ AUTO MODE BOT — BR + LONE WOLF (Level Switch) ⚡     ║", Colors.CYAN)
     print_colored("║       Level < 3 → Battle Royale  |  Level ≥ 3 → LW        ║", Colors.WHITE)
-    print_colored(f"║        Web Dashboard: http://localhost:{WEB_PORT}             ║", Colors.GREEN)
+    print_colored(f"║        Web Dashboard: http://localhost:{WEB_PORT}          ║", Colors.GREEN)
     print_colored("╚════════════════════════════════════════════════════════════╝", Colors.CYAN)
 
     try:
@@ -2450,16 +2529,35 @@ async def main():
         print_error(f"Could not start web dashboard: {e}")
 
     async def on_account_added_handler(data):
-        sync_devices_with_accounts()
-        if "token" in data and data["token"]:
-            t = str(data["token"]).strip()
-            task = asyncio.create_task(account_loop_token(t))
-            bot_state.account_workers[t[:16]] = task
-        elif "uid" in data and "password" in data:
-            u = str(data["uid"]).strip()
-            p = str(data["password"]).strip()
-            task = asyncio.create_task(account_loop_guest(u, p))
-            bot_state.account_workers[u] = task
+        try:
+            print_info(f"[CALLBACK] on_account_added fired: {list(data.keys())}")
+            accounts = load_accounts()
+
+            # Ensure this account is in accounts.json
+            if "uid" in data and "password" in data:
+                u = str(data["uid"]).strip()
+                p = str(data["password"]).strip()
+                if not any(str(a.get("uid", "")) == u for a in accounts):
+                    accounts.append({"uid": u, "password": p})
+                    save_accounts(accounts)
+
+                task = asyncio.create_task(account_loop_guest(u, p))
+                bot_state.account_workers[u] = task
+                print_info(f"[CALLBACK] Started worker for UID {u}")
+
+            elif "token" in data and data["token"]:
+                t = str(data["token"]).strip()
+                if not any(a.get("token") == t for a in accounts):
+                    accounts.append({"token": t})
+                    save_accounts(accounts)
+
+                task = asyncio.create_task(account_loop_token(t))
+                bot_state.account_workers[t[:16]] = task
+                print_info(f"[CALLBACK] Started worker for token {t[:16]}...")
+
+            sync_devices_with_accounts()
+        except Exception as e:
+            print_error(f"[CALLBACK] on_account_added error: {e}")
 
     async def on_refresh_account_handler(uid):
         await refresh_account_profile(uid)
@@ -2516,7 +2614,12 @@ async def main():
     if not accounts:
         print_warning(f"[!] No accounts found in {ACCOUNTS_FILE}. Add via Dashboard: http://localhost:{WEB_PORT}")
     else:
-        print_success(f"[✓] Loaded {len(accounts)} accounts")
+        print_success(f"[✓] Loaded {len(accounts)} accounts from {ACCOUNTS_FILE}")
+        for a in accounts:
+            if a.get("uid"):
+                print_info(f"  → UID: {a['uid']}")
+            elif a.get("token"):
+                print_info(f"  → Token: {a['token'][:16]}...")
 
     for idx, acc in enumerate(accounts):
         if "token" in acc and acc["token"]:
@@ -2530,6 +2633,8 @@ async def main():
 
         if idx < len(accounts) - 1:
             await asyncio.sleep(0.35)
+
+    print_success("[✓] All initial accounts started. Bot is running.")
 
     try:
         while True:
