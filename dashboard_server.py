@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FreeFire Level Up Bot — Dashboard Server (FIXED)
+FreeFire Level Up Bot — Dashboard Server (FIXED + Render-ready)
 Features:
   - BR / Lone Wolf mode tracking (per-account level)
   - Pause / Resume / Stop / Restart / Delete
@@ -8,6 +8,8 @@ Features:
   - Dual-ID mapping (auth_uid ↔ game_id ↔ token_prefix)
   - Real EXP progress (next_level, remaining, percent)
   - Multi-candidate safe deletion
+  - Persistent owner ↔ account mapping (survives refresh)
+  - Render DATA_DIR aware paths
 """
 
 import asyncio
@@ -17,9 +19,19 @@ import time
 from typing import Dict, List, Any, Optional, Set
 from aiohttp import web
 
-# ==================== PATHS ====================
+# ==================== PATHS (Render-aware) ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "index.html")
+
+DATA_DIR = os.getenv("DATA_DIR", ".")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    pass
+
+ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
+OWNERS_FILE = os.path.join(DATA_DIR, "owners.json")
+ALIASES_FILE = os.path.join(DATA_DIR, "aliases.json")
 
 # ==================== EXP TABLE (Level 1 → 100) ====================
 EXP_TABLE: Dict[int, int] = {
@@ -75,6 +87,30 @@ def calculate_level_progress(level: int, current_exp: int) -> Dict[str, Any]:
     }
 
 
+# ==================== PERSISTENT STORAGE HELPERS ====================
+def _read_json(path: str, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json(path: str, data) -> bool:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        print(f"[DASH] write error {path}: {e}", flush=True)
+        return False
+
+
 # ==================== BOT STATE ====================
 class BotState:
     def __init__(self):
@@ -93,6 +129,50 @@ class BotState:
         self.refresh_callbacks: Dict[str, Any] = {}
         self.account_credentials: Dict[str, Dict[str, Any]] = {}
         self.active_writers: Dict[str, Set[Any]] = {}
+        # NEW: persistent owner & alias mapping
+        self.owners: Dict[str, str] = {}
+        self.uid_aliases: Dict[str, str] = {}
+
+    # ---------- Owner / Alias persistence ----------
+    def load_owners_from_disk(self):
+        data = _read_json(OWNERS_FILE, {})
+        if isinstance(data, dict):
+            self.owners = data
+
+    def save_owners_to_disk(self):
+        _write_json(OWNERS_FILE, self.owners)
+
+    def load_aliases_from_disk(self):
+        data = _read_json(ALIASES_FILE, {})
+        if isinstance(data, dict):
+            self.uid_aliases = data
+
+    def save_aliases_to_disk(self):
+        _write_json(ALIASES_FILE, self.uid_aliases)
+
+    def set_owner(self, uid: str, owner_email: str):
+        if not uid or not owner_email:
+            return
+        self.owners[str(uid)] = str(owner_email)
+        if str(uid) in self.accounts:
+            self.accounts[str(uid)]["owner"] = str(owner_email)
+        self.save_owners_to_disk()
+
+    def set_alias(self, input_uid: str, canonical_uid: str):
+        if not input_uid or not canonical_uid:
+            return
+        inp = str(input_uid)
+        can = str(canonical_uid)
+        self.uid_aliases[inp] = can
+        self.uid_aliases.setdefault(can, can)
+        # propagate owner
+        owner = self.owners.get(inp)
+        if owner:
+            self.owners[can] = owner
+            if can in self.accounts:
+                self.accounts[can]["owner"] = owner
+        self.save_aliases_to_disk()
+        self.save_owners_to_disk()
 
     # ---------- Writer registry ----------
     def register_writer(self, uid: str, writer):
@@ -159,6 +239,10 @@ class BotState:
             self.game_to_auth_id[uid_str] = auth_uid_str
             self.account_token_map[auth_uid_str] = uid_str
             self.account_token_map[uid_str] = auth_uid_str
+            # Propagate owner from input → game_id
+            owner = self.owners.get(auth_uid_str)
+            if owner:
+                self.owners[uid_str] = owner
         if token:
             self.account_token_map[uid_str] = token
             self.account_token_map[token[:16]] = uid_str
@@ -182,6 +266,11 @@ class BotState:
             if lvl_val < MODE_SWITCH_LEVEL
             else f"Lone Wolf (Lvl ≥ {MODE_SWITCH_LEVEL})"
         )
+
+        # Resolve owner for this account (from auth_uid, game_id or token)
+        owner_for_this = (
+            self.owners.get(auth_uid_str) if auth_uid_str else None
+        ) or self.owners.get(uid_str, "")
 
         if uid_str not in self.accounts:
             self.accounts[uid_str] = {
@@ -207,6 +296,7 @@ class BotState:
                 "active_matches": 0,
                 "last_match_time": None,
                 "token": token or "",
+                "owner": owner_for_this or "",
                 "start_time": time.time(),
                 "is_paused": self.is_paused(uid_str),
                 "paused_at": time.time() if self.is_paused(uid_str) else None,
@@ -225,6 +315,8 @@ class BotState:
                 acc["level"] = lvl_val
             if token:
                 acc["token"] = token
+            if owner_for_this:
+                acc["owner"] = owner_for_this
             acc["current_exp"] = exp_val
             acc["gained_exp"] = max(0, exp_val - acc.get("initial_exp", exp_val))
             acc["next_level"] = prog["next_level"]
@@ -483,6 +575,8 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         acc["uptime_seconds"] = bot_state.get_account_uptime(uid_k)
         acc["is_paused"] = bot_state.is_paused(uid_k)
         acc["mode"] = bot_state.get_account_mode(uid_k)
+        # 🔥 Expose owner so frontend can filter + count slots
+        acc["owner"] = bot_state.owners.get(uid_k, acc.get("owner", ""))
 
     return web.json_response({
         "total_accounts": len(bot_state.accounts),
@@ -492,25 +586,22 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         "total_gained_exp": total_gained,
         "exp_per_hour": exp_per_hour,
         "accounts": accounts_data,
+        "owners": dict(bot_state.owners),        # 🔥 NEW
+        "aliases": dict(bot_state.uid_aliases),  # 🔥 NEW
         "logs": bot_state.logs[-80:],
         "uptime": uptime_sec,
-        "mode_switch_level": MODE_SWITCH_LEVEL
+        "mode_switch_level": MODE_SWITCH_LEVEL,
     })
 
 
 async def handle_add_account(request: web.Request) -> web.Response:
     try:
         data = await request.json()
-        accounts_file = "accounts.json"
-        existing = []
-        if os.path.exists(accounts_file):
-            try:
-                with open(accounts_file, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
-                    if not isinstance(existing, list):
-                        existing = []
-            except Exception:
-                existing = []
+        owner_email = str(data.get("owner", "")).strip()
+
+        existing = _read_json(ACCOUNTS_FILE, [])
+        if not isinstance(existing, list):
+            existing = []
 
         if "uid" in data and "password" in data:
             uid = str(data["uid"]).strip()
@@ -526,8 +617,15 @@ async def handle_add_account(request: web.Request) -> web.Response:
                 bot_state.account_workers.pop(uid, None)
 
             existing = [acc for acc in existing if str(acc.get("uid", "")) != uid]
-            existing.append({"uid": uid, "password": pwd})
+            entry = {"uid": uid, "password": pwd}
+            if owner_email:
+                entry["owner"] = owner_email
+            existing.append(entry)
             identifier = uid
+            # 🔥 Save owner mapping immediately
+            if owner_email:
+                bot_state.set_owner(uid, owner_email)
+                bot_state.set_alias(uid, uid)
 
         elif "token" in data:
             token = str(data["token"]).strip()
@@ -544,13 +642,17 @@ async def handle_add_account(request: web.Request) -> web.Response:
                     bot_state.account_workers.pop(k, None)
 
             existing = [acc for acc in existing if acc.get("token", "") != token]
-            existing.append({"token": token})
+            entry = {"token": token}
+            if owner_email:
+                entry["owner"] = owner_email
+            existing.append(entry)
             identifier = f"Token_{token[:8]}..."
+            if owner_email:
+                bot_state.set_owner(tok_key, owner_email)
         else:
             return web.json_response({"status": "error", "error": "Invalid payload"})
 
-        with open(accounts_file, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2)
+        _write_json(ACCOUNTS_FILE, existing)
 
         bot_state.log(f"New account added: {identifier}", "success")
 
@@ -561,7 +663,7 @@ async def handle_add_account(request: web.Request) -> web.Response:
             except Exception as e:
                 bot_state.log(f"on_account_added callback error: {e}", "error")
 
-        return web.json_response({"status": "ok"})
+        return web.json_response({"status": "ok", "identifier": identifier, "owner": owner_email})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
 
@@ -610,7 +712,7 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                     target_tokens.add(str(t))
 
         # Clean token_cache.json
-        token_cache_file = "token_cache.json"
+        token_cache_file = os.path.join(DATA_DIR, "token_cache.json")
         if os.path.exists(token_cache_file):
             try:
                 with open(token_cache_file, "r", encoding="utf-8") as f:
@@ -635,10 +737,9 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                 pass
 
         # Clean accounts.json
-        accounts_file = "accounts.json"
-        if os.path.exists(accounts_file):
+        if os.path.exists(ACCOUNTS_FILE):
             try:
-                with open(accounts_file, "r", encoding="utf-8") as f:
+                with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
                     existing = json.load(f)
                 if not isinstance(existing, list):
                     existing = []
@@ -656,14 +757,12 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                             is_match = True
                     if not is_match:
                         new_existing.append(acc)
-
-                with open(accounts_file, "w", encoding="utf-8") as f:
-                    json.dump(new_existing, f, indent=2)
+                _write_json(ACCOUNTS_FILE, new_existing)
             except Exception:
                 pass
 
         # Clean devices.json
-        devices_file = "devices.json"
+        devices_file = os.path.join(DATA_DIR, "devices.json")
         if os.path.exists(devices_file):
             try:
                 with open(devices_file, "r", encoding="utf-8") as f:
@@ -695,6 +794,11 @@ async def handle_delete_account(request: web.Request) -> web.Response:
             bot_state.game_to_auth_id.pop(cid, None)
             bot_state.account_token_map.pop(cid, None)
             bot_state.paused_accounts.discard(cid)
+            bot_state.owners.pop(cid, None)
+            bot_state.uid_aliases.pop(cid, None)
+
+        bot_state.save_owners_to_disk()
+        bot_state.save_aliases_to_disk()
 
         cancelled_keys = []
         for k, worker in list(bot_state.account_workers.items()):
@@ -797,6 +901,10 @@ async def handle_toggle_pause_all(request: web.Request) -> web.Response:
 
 # ==================== SERVER START ====================
 async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
+    # Load persistent owner/alias maps at startup
+    bot_state.load_owners_from_disk()
+    bot_state.load_aliases_from_disk()
+
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/stats", handle_get_stats)
@@ -815,13 +923,15 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     site = web.TCPSite(runner, host, port)
     await site.start()
 
-    print(f"\033[92m[+] Dashboard live at http://{host}:{port}\033[0m")
+    print(f"\033[92m[+] Dashboard live at http://{host}:{port}\033[0m", flush=True)
+    print(f"\033[92m[+] Owners loaded: {len(bot_state.owners)}\033[0m", flush=True)
+    print(f"\033[92m[+] Aliases loaded: {len(bot_state.uid_aliases)}\033[0m", flush=True)
     return runner
 
 
 if __name__ == "__main__":
     async def _test_main():
-        print("[TEST] dashboard_server.py standalone...")
+        print("[TEST] dashboard_server.py standalone...", flush=True)
         runner = await start_web_dashboard(host="0.0.0.0", port=20331)
         try:
             while True:
