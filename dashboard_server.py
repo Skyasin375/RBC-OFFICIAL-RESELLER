@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-FreeFire Level Up Bot - Professional Web Dashboard & Real-Time EXP Tracker
-Embedded Async Web Server (aiohttp)
+FreeFire Level Up Bot — Dashboard Server (FIXED)
 Features:
-  - BR → Lone Wolf auto-mode tracking (per-account level)
+  - BR / Lone Wolf mode tracking (per-account level)
   - Pause / Resume / Stop / Restart / Delete
-  - Writer registry for clean socket shutdown
+  - Writer registry (clean socket shutdown)
   - Dual-ID mapping (auth_uid ↔ game_id ↔ token_prefix)
   - Real EXP progress (next_level, remaining, percent)
-  - Multi-candidate safe deletion (accounts.json, devices.json, token_cache.json)
+  - Multi-candidate safe deletion
 """
 
 import asyncio
@@ -81,7 +80,7 @@ class BotState:
     def __init__(self):
         self.accounts: Dict[str, Dict[str, Any]] = {}
         self.logs: List[Dict[str, Any]] = []
-        self.max_logs = 200
+        self.max_logs = 300
         self.total_matches = 0
         self.total_matches_started = 0
         self.total_gained_exp = 0
@@ -147,14 +146,14 @@ class BotState:
         if len(self.logs) > self.max_logs:
             self.logs.pop(0)
 
-    # ---------- Account registration / sync ----------
+    # ---------- Account registration ----------
     def register_account(self, uid: str, nickname: str, region: str, level: int, exp: int,
                          likes: int = 0, token: Optional[str] = None,
                          auth_uid: Optional[str] = None):
         uid_str = str(uid)
         auth_uid_str = str(auth_uid) if auth_uid else self.game_to_auth_id.get(uid_str, "")
 
-        # Maintain dual-ID mapping
+        # Dual-ID mapping
         if auth_uid_str:
             self.auth_to_game_id[auth_uid_str] = uid_str
             self.game_to_auth_id[uid_str] = auth_uid_str
@@ -299,7 +298,7 @@ class BotState:
                 target_acc["paused_at"] = time.time()
                 target_acc["status"] = "PAUSED"
             nick = target_acc.get("nickname", target_key) if target_acc else target_key
-            self.log(f"⏸ UID {target_key} ({nick}) matchmaking PAUSED.", "warning", target_key)
+            self.log(f"⏸ UID {target_key} ({nick}) PAUSED.", "warning", target_key)
             cb = self.refresh_callbacks.get("on_pause_toggle")
             if cb:
                 try:
@@ -318,7 +317,7 @@ class BotState:
                     target_acc["paused_at"] = None
                 target_acc["status"] = "ONLINE"
             nick = target_acc.get("nickname", target_key) if target_acc else target_key
-            self.log(f"▶ UID {target_key} ({nick}) matchmaking RESUMED.", "success", target_key)
+            self.log(f"▶ UID {target_key} ({nick}) RESUMED.", "success", target_key)
             cb = self.refresh_callbacks.get("on_pause_toggle")
             if cb:
                 try:
@@ -381,7 +380,7 @@ class BotState:
 
         if old_level < MODE_SWITCH_LEVEL <= current_lvl:
             self.log(
-                f"🎉 UID {uid_str} ({acc['nickname']}) reached Level {current_lvl}! "
+                f"🎉 LEVEL UP! UID {uid_str} ({acc['nickname']}) reached Level {current_lvl}! "
                 f"Switching BR → Lone Wolf.",
                 "success", uid_str
             )
@@ -688,7 +687,7 @@ async def handle_delete_account(request: web.Request) -> web.Response:
             except Exception:
                 pass
 
-        # Clean in-memory state
+        # Clean in-memory
         for cid in candidate_ids:
             bot_state.accounts.pop(cid, None)
             bot_state.account_credentials.pop(cid, None)
@@ -697,7 +696,6 @@ async def handle_delete_account(request: web.Request) -> web.Response:
             bot_state.account_token_map.pop(cid, None)
             bot_state.paused_accounts.discard(cid)
 
-        # Cancel workers
         cancelled_keys = []
         for k, worker in list(bot_state.account_workers.items()):
             k_str = str(k)
@@ -761,7 +759,6 @@ async def handle_restart_account(request: web.Request) -> web.Response:
             except Exception as e:
                 bot_state.log(f"restart callback error: {e}", "error")
         else:
-            # Fallback: refresh profile
             cb2 = bot_state.refresh_callbacks.get("on_refresh_account")
             if cb2:
                 try:
@@ -805,8 +802,10 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     app.router.add_get("/api/stats", handle_get_stats)
     app.router.add_post("/api/account/add", handle_add_account)
     app.router.add_post("/api/account/delete", handle_delete_account)
+    app.router.add_post("/api/account/remove", handle_delete_account)
     app.router.add_post("/api/account/refresh", handle_refresh_account)
     app.router.add_post("/api/account/restart", handle_restart_account)
+    app.router.add_post("/api/account/stop", handle_toggle_pause)
     app.router.add_post("/api/account/pause", handle_toggle_pause)
     app.router.add_post("/api/account/pause_all", handle_toggle_pause_all)
     app.router.add_post("/api/logs/clear", handle_clear_logs)
