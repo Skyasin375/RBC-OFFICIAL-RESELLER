@@ -165,7 +165,6 @@ body:before{
 .tag.ind{background:rgba(255,173,47,.12);color:var(--gold);border:1px solid rgba(255,173,47,.25)}
 .tag.sg{background:rgba(168,85,247,.12);color:#a78bfa;border:1px solid rgba(168,85,247,.25)}
 .tag.default{background:rgba(77,231,255,.12);color:var(--cyan);border:1px solid rgba(77,231,255,.25)}
-/* NEW: Mode badge (BR / LW) inside account card */
 .tag.mode-br{background:rgba(255,140,26,.15);color:#ff8c1a;border:1px solid rgba(255,140,26,.42)}
 .tag.mode-lw{background:rgba(17,223,255,.15);color:#11dfff;border:1px solid rgba(17,223,255,.42)}
 .account .identity strong{display:block;font-size:14px;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.2}
@@ -282,7 +281,7 @@ textarea.input{resize:vertical;min-height:70px;font-family:'JetBrains Mono';font
 .notice b{color:var(--text)}
 .notice code{font-family:'JetBrains Mono';color:var(--cyan);font-size:10px;word-break:break-all}
 
-/* MODE ROUTING HINT (NEW) */
+/* MODE ROUTING HINT */
 .mode-hint{margin-top:14px;padding:14px 16px;border-radius:14px;
   background:linear-gradient(90deg,rgba(255,140,26,.07),rgba(17,223,255,.07));
   border:1px solid rgba(255,173,47,.28);font-size:12.5px;line-height:1.7}
@@ -722,9 +721,7 @@ body.hasann .nav{top:54px}
   <button class="nav-item" data-page="contact" onclick="gotoPage('contact')"><i class="fa-brands fa-telegram"></i> Contact</button>
 </div>
 
-<!-- ============================================================
-     ADD ACCOUNT MODAL — WITH MODE ROUTING HINT (NEW)
-     ============================================================ -->
+<!-- ADD ACCOUNT MODAL -->
 <div class="modal" id="addAccountModal">
   <div class="dialog">
     <div class="dialog-head">
@@ -747,7 +744,7 @@ body.hasann .nav{top:54px}
       <div class="field"><label>ACCESS TOKEN</label><textarea class="input" id="accToken" rows="4" placeholder="Paste access token"></textarea></div>
     </div>
 
-    <!-- 🎮 MODE ROUTING HINT (BR vs Lone Wolf) -->
+    <!-- MODE ROUTING HINT -->
     <div class="mode-hint">
       <div class="title">🎮 Mode Routing — Auto Selected By Level</div>
       <div class="row">
@@ -1155,19 +1152,26 @@ function renderDashboard(){
   }
 }
 
+/* 🔥 SERVER-SIDE FILTER — FIXED: fallback to owner email match */
 function getMyAccounts(){
   if(SESSION.role!=='user'||!SESSION.credential)return[];
+  const myEmail=(SESSION.credential.email||'').toLowerCase();
   const mine=myCanonicalSet();
-  return Object.values(ACCOUNTS_CACHE).filter(a=>mine.has(String(a.uid)));
+  return Object.values(ACCOUNTS_CACHE).filter(a=>{
+    // Priority 1: match by canonical set (server-side owners + aliases)
+    if(mine.has(String(a.uid)))return true;
+    // Priority 2: match by owner field directly from server
+    const owner=String(a.owner||'').toLowerCase();
+    if(owner && owner===myEmail)return true;
+    return false;
+  });
 }
 
 function renderUserStats(){
   const accs=getMyAccounts();
-  const mine=myCanonicalSet();
   const slots=SESSION.credential.slots||0;
-  const usedCanonical=new Set();
-  for(const a of accs)usedCanonical.add(String(a.uid));
-  const used=usedCanonical.size;
+  // 🔥 FIXED: server-side slot count — used = actual accounts registered on bot
+  const used=accs.length;
   $('slotsAvail').textContent=Math.max(0,slots-used);
   $('sActive').textContent=accs.length;
   const totalExp=accs.reduce((n,a)=>n+(Number(a.gained_exp)||0),0);
@@ -1192,8 +1196,8 @@ function setFilter(f){
 }
 
 function pendingForMyKey(){
-  const myKey=SESSION.credential?.email;
-  return Object.entries(PENDING).filter(([uid,meta])=>meta.owner===myKey)
+  const myKey=(SESSION.credential?.email||'').toLowerCase();
+  return Object.entries(PENDING).filter(([uid,meta])=>(meta.owner||'').toLowerCase()===myKey)
     .map(([uid,meta])=>({
       uid, _pending:true, _error:meta.error,
       nickname:null,region:null,level:null,current_exp:null,
@@ -1222,7 +1226,6 @@ function regionTag(region){
   return `<span class="tag ${cls}">${label}</span>`;
 }
 
-/* 🔥 MODE TAG — NEW: BR (orange) for level < 3, LW (cyan) for level >= 3 */
 function modeTag(level){
   const lv=Number(level)||0;
   if(!lv)return '';
@@ -1372,8 +1375,9 @@ function updateCooldownBtns(){
 /* ============ ACCOUNT ACTIONS ============ */
 function openAddAccount(){
   if(!SESSION.credential){toast('Login first','warn');return}
-  const owners=loadOwners();
-  const used=Object.values(owners).filter(k=>k===SESSION.credential.email).length;
+  // 🔥 FIXED: server-side slot count
+  const accs=getMyAccounts();
+  const used=accs.length;
   const slots=SESSION.credential.slots||0;
   if(used>=slots){
     $('slotNotice').innerHTML=`<b style="color:var(--red)">SLOT LIMIT REACHED</b> — ${used}/${slots} slots used.`;
@@ -1412,11 +1416,7 @@ async function submitAddAccount(){
   if(!res.ok||!res.data||res.data.status!=='ok'){
     toast(res.data?.error||`Backend error (HTTP ${res.status})`,'err');return;
   }
-  const owners=loadOwners();
-  owners[pendingUid]=SESSION.credential.email;
-  saveOwners(owners);
-  SERVER_ALIASES[pendingUid]=pendingUid;
-  PENDING[pendingUid]={startedAt:Date.now(),owner:SESSION.credential.email,requestKey};
+  PENDING[requestKey]={startedAt:Date.now(),owner:SESSION.credential.email};
   toast('Account submitted — syncing player info','ok');
   closeModal('addAccountModal');
   $('accUid').value='';$('accPassword').value='';$('accToken').value='';
@@ -1426,16 +1426,15 @@ async function submitAddAccount(){
     tries++;
     await refreshStats();
     const canon=SERVER_ALIASES[requestKey];
-    const found=canon?ACCOUNTS_CACHE[String(canon)]:ACCOUNTS_CACHE[String(pendingUid)];
+    const found=canon?ACCOUNTS_CACHE[String(canon)]:ACCOUNTS_CACHE[String(requestKey)];
     if(found||tries>=40){
       clearInterval(t);
       if(found){
-        delete PENDING[pendingUid];
-        const owners2=loadOwners();
-        if(canon){owners2[String(canon)]=SESSION.credential.email;saveOwners(owners2);}
+        delete PENDING[requestKey];
+        if(canon)SERVER_ALIASES[requestKey]=String(canon);
         toast('Account verified — real profile loaded','ok');
       }else{
-        if(PENDING[pendingUid])PENDING[pendingUid].error='Player info timeout';
+        if(PENDING[requestKey])PENDING[requestKey].error='Player info timeout';
       }
       renderDashboard();
     }
@@ -1480,6 +1479,7 @@ function showInfo(uid){
   $('infoContent').innerHTML=`
     <div><b style="color:var(--cyan)">Nickname:</b> ${esc(a.nickname||'—')}</div>
     <div><b style="color:var(--cyan)">UID:</b> ${esc(a.uid)}</div>
+    <div><b style="color:var(--cyan)">Owner:</b> ${esc(a.owner||'—')}</div>
     <div><b style="color:var(--cyan)">Region:</b> ${esc(a.region||'—')}</div>
     <div><b style="color:var(--cyan)">Level:</b> ${esc(a.level||'—')}</div>
     <div><b style="color:var(--cyan)">Mode:</b> ${esc(mode)}</div>
@@ -1661,11 +1661,12 @@ function clearConsoleUI(){
   const b=$('consoleBody');if(b)b.innerHTML='<div style="color:var(--muted);padding:8px 0">Console cleared locally</div>';
 }
 
-/* ============ POLLING ============ */
+/* ============ POLLING — FIXED ============ */
 async function refreshStats(){
   const res=await api('/stats');
   if(!res.ok||!res.data)return;
 
+  // 🔥 FIXED: server owners always overwrite (never wipe from localStorage)
   if(res.data.owners&&typeof res.data.owners==='object'){
     SERVER_OWNERS=res.data.owners;
     const lo=loadOwners();
@@ -1673,16 +1674,11 @@ async function refreshStats(){
     for(const [u,o] of Object.entries(SERVER_OWNERS)){
       if(lo[u]!==o){lo[u]=o;changed=true;}
     }
+    // NOTE: we do NOT delete existing local entries — server authoritative
     if(changed)saveOwners(lo);
   }
   if(res.data.aliases&&typeof res.data.aliases==='object'){
     SERVER_ALIASES=res.data.aliases;
-    const lo=loadOwners();
-    let changed=false;
-    for(const [inp,can] of Object.entries(SERVER_ALIASES)){
-      if(lo[inp]&&!lo[can]){lo[can]=lo[inp];changed=true;}
-    }
-    if(changed)saveOwners(lo);
   }
 
   const accounts=Array.isArray(res.data.accounts)?res.data.accounts:[];
@@ -1691,11 +1687,11 @@ async function refreshStats(){
     if(a&&a.uid){
       const k=String(a.uid);
       newCache[k]={...(ACCOUNTS_CACHE[k]||{}),...a,uid:k};
+      // Clear pending state for this uid
       if(PENDING[k])delete PENDING[k];
+      // Also clear pending for alias → uid
       for(const inp in SERVER_ALIASES){
-        if(String(SERVER_ALIASES[inp])===k&&PENDING[inp]){
-          delete PENDING[inp];
-        }
+        if(String(SERVER_ALIASES[inp])===k&&PENDING[inp])delete PENDING[inp];
       }
     }
   }
@@ -1901,7 +1897,7 @@ function navSync(){
 }
 const _lt=loadTelegramSettings;loadTelegramSettings=async function(){await _lt();navSync()};
 
-/* ===== v8 alias resolver ===== */
+/* ===== v8 alias resolver — FIXED ===== */
 (function installSyncDataFix(){
   const sleep=ms=>new Promise(r=>setTimeout(r,ms));
   const first=(o,keys,def=null)=>{
@@ -1938,6 +1934,7 @@ const _lt=loadTelegramSettings;loadTelegramSettings=async function(){await _lt()
     out.last_match_time=first(src,['last_match_time','lastMatchTime','last_match','lastMatch'],out.last_match_time||'—');
     out.status=String(first(src,['status','state','bot_status','botStatus'],out.status||'ONLINE')||'ONLINE').toUpperCase();
     out.paused=!!first(src,['paused','is_paused','isPaused'],out.paused||false);
+    out.owner=String(first(src,['owner','email','user'],out.owner||'')||'');
     return out;
   };
   const extractAccounts=(data)=>{
@@ -2027,8 +2024,8 @@ const _lt=loadTelegramSettings;loadTelegramSettings=async function(){await _lt()
         const aliasNow=SERVER_ALIASES[requestKey];
         const target=aliasNow?ACCOUNTS_CACHE[String(aliasNow)]:null;
         const newOwned=Object.values(ACCOUNTS_CACHE||{}).filter(a=>{
-          const own=loadOwners()[String(a.uid)];
-          return own===ownerEmail&&!beforeKeys.has(String(a.uid));
+          const own=String(a.owner||'').toLowerCase();
+          return own===String(ownerEmail).toLowerCase()&&!beforeKeys.has(String(a.uid));
         })[0];
         const hit=target||newOwned;
         if(hit){
