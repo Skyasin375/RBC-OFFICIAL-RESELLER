@@ -41,17 +41,13 @@ import thunderFF_pb2
 from dashboard_server import bot_state, start_web_dashboard
 
 # ==================== CONFIGURATION (Render-ready) ====================
-# Render injects PORT. Locally defaults to 31178.
 WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("PORT", os.getenv("WEB_PORT", "31178")))
 
-# Public base URL — set this in Render env vars (e.g. https://rbc-level.onrender.com)
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://rbclevelofficial.onrender.com").rstrip("/")
 
-# Comma-separated allowed origins for CORS. "*" is fine for a public dashboard.
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
-# Persistent data directory (Render disk mount). Defaults to current dir.
 DATA_DIR = os.getenv("DATA_DIR", ".")
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -589,7 +585,7 @@ async def get_access_token(uid, password):
     for attempt in range(5):
         try:
             response = await client.post(url, headers=hdrs, data=data)
-            print_info(f"[OAUTH] Attempt {attempt+1}/5 → HTTP {response.status_code} | URL: {url}")
+            print_info(f"[OAUTH] Attempt {attempt+1}/5 → HTTP {response.status_code}")
             body = response.text
             print_info(f"[OAUTH] RAW BODY: {body[:600]}")
             if response.status_code == 200:
@@ -605,13 +601,13 @@ async def get_access_token(uid, password):
                 if open_id and access_token:
                     print_success(f"[OAUTH] OK → open_id={open_id[:12]}... | platform={platform}")
                     return open_id, access_token, platform
-                print_error(f"[OAUTH] Missing tokens in body: {response_data}")
+                print_error(f"[OAUTH] Missing tokens: {response_data}")
             elif response.status_code == 429:
                 print_warning("[OAUTH] Rate limited (429), retrying...")
                 await asyncio.sleep(1)
                 continue
             else:
-                print_error(f"[OAUTH] Non-200 → status={response.status_code} | body={body[:500]}")
+                print_error(f"[OAUTH] Non-200 → {response.status_code} | {body[:500]}")
         except Exception as e:
             import traceback
             print_error(f"[OAUTH] EXCEPTION: {e}")
@@ -642,7 +638,7 @@ async def decode_protobuf(data):
     return json.dumps(parsed_results_dict)
 
 
-# ==================== PLAYER PROFILE FETCH (GetPlayerPersonalShow) ====================
+# ==================== PLAYER PROFILE FETCH (FIXED) ====================
 REGION_BASE_MAP = {
     "BD": "https://clientbp.common.ggbluefox.com",
     "SG": "https://clientbp.common.ggbluefox.com",
@@ -671,10 +667,48 @@ async def _encode_varint(n: int) -> bytes:
     return bytes(out)
 
 
+# Level minimum EXP estimates (fallback agar server exp=0 bhej de)
+LEVELS_MIN_EXP = {
+    1: 0, 2: 48, 3: 202, 4: 544, 5: 1012, 6: 1844, 7: 2792, 8: 3800, 9: 4870, 10: 6004,
+    11: 7192, 12: 8448, 13: 9776, 14: 11140, 15: 12566, 16: 14060, 17: 15610, 18: 17224,
+    19: 18902, 20: 20632, 21: 22424, 22: 24728, 23: 26192, 24: 28166, 25: 30200,
+    26: 32294, 27: 34448, 28: 37804, 29: 41174, 30: 44870, 31: 48852, 32: 53334,
+    33: 58566, 34: 64096, 35: 69994, 36: 76460, 37: 83108, 38: 91128, 39: 99322,
+    40: 108092, 41: 120144, 42: 133266, 43: 147472, 44: 162760, 45: 179126,
+    46: 196572, 47: 215368, 48: 235516, 49: 257010, 50: 279860, 51: 304056,
+    52: 348318, 53: 394982, 54: 444044, 55: 495508, 56: 549364, 57: 633756,
+    58: 721744, 59: 813336, 60: 908522, 61: 1041438, 62: 1180352, 63: 1325256,
+    64: 1476184, 65: 1634300, 66: 1840946, 67: 2056594, 68: 2281242, 69: 2514880,
+    70: 2757530, 71: 3059506, 72: 3372284, 73: 3699456, 74: 4041030, 75: 4397020,
+    76: 4829104, 77: 5282204, 78: 5756304, 79: 6251404, 80: 6767504, 81: 7381324,
+    82: 8043154, 83: 8752952, 84: 9510808, 85: 10316638, 86: 11277190, 87: 12360748,
+    88: 13360304, 89: 14482858, 90: 15659418, 91: 17026708, 92: 18453688,
+    93: 19941280, 94: 21488570, 95: 23095858, 96: 24763138, 97: 26490138,
+    98: 28277708, 99: 30124996, 100: 32032284,
+}
+
+
+def _min_exp_for_level(level: int) -> int:
+    """Level se minimum EXP estimate karo."""
+    try:
+        lv = int(level)
+    except (TypeError, ValueError):
+        return 0
+    if lv <= 1:
+        return 0
+    best = 0
+    for k in sorted(LEVELS_MIN_EXP.keys()):
+        if k <= lv:
+            best = LEVELS_MIN_EXP[k]
+        else:
+            break
+    return best
+
+
 async def fetch_player_profile(uid, region, bearer_token):
     """
-    Fetch real player profile (nickname, level, exp, likes, region) from
-    GetPlayerPersonalShow.
+    Fetch real player profile (nickname, level, exp, likes, region).
+    FIX: 3x retry, X-GA header, exp=0 fallback, debug logging.
     """
     try:
         uid_int = int(uid)
@@ -704,14 +738,22 @@ async def fetch_player_profile(uid, region, bearer_token):
         "Accept-Encoding": "gzip",
     }
 
-    try:
-        resp = await client.post(url, headers=req_headers, data=body)
-    except Exception as e:
-        print_error(f"[PROFILE] request failed uid={uid}: {e}")
-        return None
+    # ✅ 3 attempts
+    resp = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = await client.post(url, headers=req_headers, data=body)
+            if resp.status_code in (200, 201):
+                break
+            print_warning(f"[PROFILE] attempt {attempt+1} HTTP {resp.status_code} for uid={uid}")
+        except Exception as e:
+            last_err = e
+            print_warning(f"[PROFILE] attempt {attempt+1} failed uid={uid}: {e}")
+        await asyncio.sleep(1.5)
 
-    if resp.status_code not in (200, 201):
-        print_error(f"[PROFILE] HTTP {resp.status_code} uid={uid} | {resp.text[:200]}")
+    if not resp or resp.status_code not in (200, 201):
+        print_error(f"[PROFILE] all attempts failed for uid={uid} | err={last_err}")
         return None
 
     try:
@@ -720,6 +762,13 @@ async def fetch_player_profile(uid, region, bearer_token):
     except Exception as e:
         print_error(f"[PROFILE] decode failed uid={uid}: {e}")
         return None
+
+    # ✅ Debug — Render logs me dikhega
+    try:
+        print_info(f"[PROFILE-DEBUG] uid={uid} keys={list(decoded.keys())[:20] if isinstance(decoded, dict) else 'N/A'}")
+        print_info(f"[PROFILE-DEBUG] uid={uid} decoded={json.dumps(decoded)[:500]}")
+    except Exception:
+        pass
 
     wrapper = decoded.get("1", {}).get("data", {}) if isinstance(decoded, dict) else {}
     if not isinstance(wrapper, dict):
@@ -751,6 +800,13 @@ async def fetch_player_profile(uid, region, bearer_token):
     if likes < 0:
         likes = 0
 
+    # ✅ FIX: Agar exp=0 but level>1, to level se minimum exp estimate karo
+    if exp == 0 and level > 1:
+        est = _min_exp_for_level(level)
+        if est > 0:
+            exp = est
+            print_warning(f"[PROFILE] UID {uid} exp=0 → estimated {exp} from level {level}")
+
     print_success(
         f"[PROFILE] UID {uid} → nickname={nickname!r} | level={level} | "
         f"exp={exp} | likes={likes} | region={player_region}"
@@ -767,7 +823,6 @@ async def fetch_player_profile(uid, region, bearer_token):
 
 # ==================== SAFE PROTO SETTER ====================
 def _safe_set(proto, field_name, value):
-    """Set proto field only if it exists — prevents AttributeError."""
     try:
         setattr(proto, field_name, value)
         return True
@@ -775,7 +830,7 @@ def _safe_set(proto, field_name, value):
         return False
 
 
-# ==================== FIXED MAJORLOGIN PAYLOAD ====================
+# ==================== MAJORLOGIN PAYLOAD ====================
 async def build_majorlogin_payload(open_id, access_token, platform, client_version, device_info):
     try:
         proto = thunderFF_pb2.MajorLoginReq()
@@ -885,19 +940,18 @@ async def send_majorlogin(data, release_version, server_url):
         req_headers = headers.copy()
         req_headers["ReleaseVersion"] = release_version
         print_info(f"[MAJORLOGIN] POST → {url}")
-        print_info(f"[MAJORLOGIN] ReleaseVersion={release_version} | payload_size={len(data)} bytes")
         response = await client.post(url, headers=req_headers, data=data)
         print_info(f"[MAJORLOGIN] HTTP {response.status_code} | resp_len={len(response.content)} bytes")
         if response.status_code != 200:
-            print_error(f"[MAJORLOGIN] Non-200 → status={response.status_code}")
+            print_error(f"[MAJORLOGIN] Non-200 → {response.status_code}")
             try:
-                print_error(f"[MAJORLOGIN] RAW BODY (first 800): {response.text[:800]}")
+                print_error(f"[MAJORLOGIN] BODY: {response.text[:800]}")
             except Exception:
-                print_error(f"[MAJORLOGIN] RAW HEX (first 200): {response.content[:200].hex()}")
+                print_error(f"[MAJORLOGIN] HEX: {response.content[:200].hex()}")
             return None
 
         response_content = response.content
-        print_info(f"[MAJORLOGIN] FULL HEX ({len(response_content)} bytes): {response_content.hex()}")
+        print_info(f"[MAJORLOGIN] FULL HEX ({len(response_content)}): {response_content.hex()[:400]}...")
 
         try:
             with open("majorlogin_response.bin", "wb") as f:
@@ -948,18 +1002,17 @@ async def send_getlogin(data, base_url, token, release_version):
         req_headers['Authorization'] = f"Bearer {token}"
         req_headers['Host'] = "clientbp.ppmainecoonghj.com"
         print_info(f"[GETLOGIN] POST → {url}")
-        print_info(f"[GETLOGIN] Token (first 20): {token[:20]}... | payload_size={len(data)} bytes")
         response = await client.post(url, headers=req_headers, data=data)
         print_info(f"[GETLOGIN] HTTP {response.status_code} | resp_len={len(response.content)} bytes")
         if response.status_code != 200:
-            print_error(f"[GETLOGIN] Non-200 → status={response.status_code}")
+            print_error(f"[GETLOGIN] Non-200 → {response.status_code}")
             try:
-                print_error(f"[GETLOGIN] RAW BODY (first 800): {response.text[:800]}")
+                print_error(f"[GETLOGIN] BODY: {response.text[:800]}")
             except Exception:
-                print_error(f"[GETLOGIN] RAW HEX (first 200): {response.content[:200].hex()}")
+                print_error(f"[GETLOGIN] HEX: {response.content[:200].hex()}")
             return None
         response_content = response.content
-        print_info(f"[GETLOGIN] FIRST 64 BYTES: {response_content[:64].hex()}")
+        print_info(f"[GETLOGIN] FIRST 64: {response_content[:64].hex()}")
 
         res_proto = thunderFF_pb2.GetLoginDataRes()
         parsed_successfully = False
@@ -1018,7 +1071,7 @@ async def send_keep_alive(region="BD"):
 
 
 async def start_game_lone_wolf(region, client_version, writer, key, iv):
-    packet = bytes.fromhex("080112800a0a010b102b3a110a044944433110aa011a064555524f50453a100a044944433210311a064555524f504540014a0801090a0b1219202758016291090a8001303838463832424630324139363736373032303130313030303030303030303030303136303030313030313530303032323246393745454530463030303030303436373632353134303030303030303030303030303030303030303030303030303030303030303030303030303066663030303030303030636163666131366410241afb02735d5e571400024a775d45414d1a041b1c001f11010449715f4243481a001e1d071c1703004b1a4066785c524570735c51486775421b5c5a4c07504042685a63610816054e19025e75196001477c015165406370195f5547404e4550640103020f1304064863754268676c755f65576e40467e5f0a417a4701026d675d6e73670b1108495a4c6a0b78470b740065645e525a057258425f584a447d4e6759440c11044e7c596d7f4b625f7d04055a47505c4e1d6b5b4107447d7201057d7f0f14084e430457674f7e517d72015172415d027473577c4d615f79535256780911030f4d5e027a797f614165067806505d53777750475e75064257076500460817014e741e7e5078487e7a7c465e7669767153497064605a7376677773550d160148037e18675966787f4c42607a645f577e7b441b460776026b18685d0b110205490060020f70676175654674706671797f41067346677c4e06585e780f15074c57047b40517075415f6364027259674b5b0166407f7340600407770a22047a5d5c52300b3a0a167305067162727516134208312e3133302e3232480350015ae90403626253513635686e556f4e36416456324b796f566c636f477776484f624e56526c4d727073504b4f43654177616848494176795556497273743752737149734a7a786b3247525268377a2f637664626d504f6a73552f79626d38547a4c69586d2f474351696d494b53486833447955726f39515152756c34545350626d6d624b7949565937545671577059455372323646572f59624578507338514f706d317372785455736c30796a434144444d4f34616a654b615753366361496c554b4963797a494e396d52516f715277687939797257476d337a644345337a6a61436f492f5a585233656f65365a42647a64677654636b6b665733356e4d4c6a6a565072564b6433523172756174394e50514150724a5546627859696c4c5a3859707336654d5447666b6649793574666a526c314d4648706b51774c6373374439656378566c41636f374e664f6d2b30654756466c4434744478706771385533595973587645384842502f70666c767a737138316a32524f4d7857437556445442492f684735625462773166456e4249725162762b636144775147696f74554e316d4c4b77734379456f4766706746614251457645672b736a764c4c78704743334c304a5344532f74526169504354553344374e6249306547516651622f5a466f4c36455630775a324d6f583932414c572f5049752f56634663584e70596b356f7966326151416a536971486a2f363276354843644f525551303578754e6171795251625653704654303137655237675255636b4966366c6f447476342b514e4a4670766d74757077707774396a5a5974437a4b56743657726d6e36785837706658456251555434684f3758a201050803108703a201050804108103a20105080510c001a20105081d10cc01a2010408161078a20105080e10af01a201020815")
+    packet = bytes.fromhex("080112800a0a010b102b3a110a044944433110aa011a064555524f50453a100a044944433210311a064555524f504540014a0801090a0b1219202758016291090a8001303838463832424630324139363736373032303130313030303030303030303030303030303136303030313030313530303032323246393745454530463030303030303436373632353134303030303030303030303030303030303030303030303030303030303030303030303030303066663030303030303030636163666131366410241afb02735d5e571400024a775d45414d1a041b1c001f11010449715f4243481a001e1d071c1703004b1a4066785c524570735c51486775421b5c5a4c07504042685a63610816054e19025e75196001477c015165406370195f5547404e4550640103020f1304064863754268676c755f65576e40467e5f0a417a4701026d675d6e73670b1108495a4c6a0b78470b740065645e525a057258425f584a447d4e6759440c11044e7c596d7f4b625f7d04055a47505c4e1d6b5b4107447d7201057d7f0f14084e430457674f7e517d72015172415d027473577c4d615f79535256780911030f4d5e027a797f614165067806505d53777750475e75064257076500460817014e741e7e5078487e7a7c465e7669767153497064605a7376677773550d160148037e18675966787f4c42607a645f577e7b441b460776026b18685d0b110205490060020f70676175654674706671797f41067346677c4e06585e780f15074c57047b40517075415f6364027259674b5b0166407f7340600407770a22047a5d5c52300b3a0a167305067162727516134208312e3133302e3232480350015ae90403626253513635686e556f4e36416456324b796f566c636f477776484f624e56526c4d727073504b4f43654177616848494176795556497273743752737149734a7a786b3247525268377a2f637664626d504f6a73552f79626d38547a4c69586d2f474351696d494b53486833447955726f39515152756c34545350626d6d624b7949565937545671577059455372323646572f59624578507338514f706d317372785455736c30796a434144444d4f34616a654b615753366361496c554b4963797a494e396d52516f715277687939797257476d337a644345337a6a61436f492f5a585233656f65365a42647a64677654636b6b665733356e4d4c6a6a565072564b6433523172756174394e50514150724a5546627859696c4c5a3859707336654d5447666b6649793574666a526c314d4648706b51774c6373374439656378566c41636f374e664f6d2b30654756466c4434744478706771385533595973587645384842502f70666c767a737138316a32524f4d7857437556445442492f684735625462773166456e4249725162762b636144775147696f74554e316d4c4b77734379456f4766706746614251457645672b736a764c4c78704743334c304a5344532f74526169504354553344374e6249306547516651622f5a466f4c36455630775a324d6f583932414c572f5049752f56634663584e70596b356f7966326151416a536971486a2f363276354843644f525551303578754e6171795251625653704654303137655237675255636b4966366c6f447476342b514e4a4670766d74757077707774396a5a5974437a4b56743657726d6e36785837706658456251555434684f3758a201050803108703a201050804108103a20105080510c001a20105081d10cc01a2010408161078a20105080e10af01a201020815")
     proto = thunderFF_pb2.StartMatch()
     proto.ParseFromString(packet)
     if hasattr(proto.main, 'region_list') and len(proto.main.region_list) > 0:
@@ -1988,6 +2041,7 @@ async def refresh_account_profile(account_data_or_uid: Any):
 
         profile = await fetch_player_profile(acc_id, region, bearer)
         if not profile:
+            print_warning(f"[EXP-REFRESH] Profile fetch failed for {acc_id}")
             return
 
         level = profile['level']
@@ -2026,6 +2080,7 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
             bot_state.set_alias(str(uid), acc_id)
         except Exception:
             pass
+        # ✅ Profile refresh — fail ho to account registered rahe
         try:
             profile = await fetch_player_profile(
                 acc_id,
@@ -2071,7 +2126,7 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
         print_success(f"[STEP 2/4] OK → open_id={open_id[:12]}... | platform={platform}")
 
         device_info = get_device_for_account(uid)
-        print_info(f"[DEVICE] Using: {device_info.get('model')} | {device_info.get('gpu_renderer')} | {device_info.get('system_software')}")
+        print_info(f"[DEVICE] Using: {device_info.get('model')} | {device_info.get('gpu_renderer')}")
 
         print_info(f"[STEP 3/4] Building MajorLogin payload + POST...")
         login_payload_data = await build_majorlogin_payload(open_id, access_token, platform, client_version, device_info)
@@ -2084,22 +2139,16 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
             return None
         print_success(f"[STEP 3/4] OK → account_id={majorlogin_response.account_id} | region={majorlogin_response.region}")
 
-        print_info(f"[STEP 4/4] Fetching login data (GetLoginData)...")
-        getlogin_result = await send_getlogin(login_payload_data, majorlogin_response.url, majorlogin_response.token, release_version)
-        if getlogin_result is None:
-            print_error(f"[STEP 4/4] FAILED")
-            return None
-        res_proto, dict_res = getlogin_result
-        print_success(f"[STEP 4/4] OK → nickname={res_proto.nickname}")
-
         acc_id = str(majorlogin_response.account_id)
 
+        # ✅ Alias turant set karo
         try:
             bot_state.set_alias(str(uid), acc_id)
         except Exception:
             pass
 
-        nickname = res_proto.nickname or f"Player_{acc_id}"
+        # ✅ Default values — inhe pehle register karo taaki account dashboard me dikh jaye
+        nickname = f"Player_{acc_id[-6:]}"
         region = majorlogin_response.region or "BD"
         level = 1
         exp = 0
@@ -2110,19 +2159,45 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
             level=level, exp=exp, likes=likes
         )
 
-        profile = await fetch_player_profile(
-            acc_id, region, majorlogin_response.token
+        # -------- Step 4: GetLoginData (fail ho to bhi account registered rahe) --------
+        print_info(f"[STEP 4/4] Fetching login data (GetLoginData)...")
+        getlogin_result = await send_getlogin(
+            login_payload_data,
+            majorlogin_response.url,
+            majorlogin_response.token,
+            release_version
         )
-        if profile:
-            nickname = profile['nickname'] or nickname
-            region = profile['region'] or region
-            level = profile['level']
-            exp = profile['exp']
-            likes = profile['likes']
-            bot_state.register_account(
-                uid=acc_id, nickname=nickname, region=region,
-                level=level, exp=exp, likes=likes
-            )
+
+        functional_addrs = ""
+        informational_addrs = ""
+
+        if getlogin_result is None:
+            print_warning(f"[STEP 4/4] GetLoginData failed — registering with defaults")
+        else:
+            res_proto, dict_res = getlogin_result
+            functional_addrs = res_proto.functional_addrs or get_proto_field(dict_res, 14) or ""
+            informational_addrs = res_proto.informational_addrs or get_proto_field(dict_res, 32) or ""
+            if res_proto.nickname:
+                nickname = res_proto.nickname
+            print_success(f"[STEP 4/4] OK → nickname={res_proto.nickname} | func={bool(functional_addrs)} | info={bool(informational_addrs)}")
+
+        # -------- Profile fetch (best effort) --------
+        try:
+            profile = await fetch_player_profile(acc_id, region, majorlogin_response.token)
+            if profile:
+                nickname = profile['nickname'] or nickname
+                region = profile['region'] or region
+                level = profile['level']
+                exp = profile['exp']
+                likes = profile['likes']
+        except Exception as e:
+            print_error(f"[PROFILE] Initial fetch error: {e}")
+
+        # ✅ Final register with real data
+        bot_state.register_account(
+            uid=acc_id, nickname=nickname, region=region,
+            level=level, exp=exp, likes=likes
+        )
 
         account_data = {
             'account_id': majorlogin_response.account_id,
@@ -2138,8 +2213,8 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
             'server_time': majorlogin_response.server_time,
             'aes_ak': majorlogin_response.aes_ak,
             'iv_i': majorlogin_response.iv_i,
-            'functional_addrs': res_proto.functional_addrs or get_proto_field(dict_res, 14),
-            'informational_addrs': res_proto.informational_addrs or get_proto_field(dict_res, 32),
+            'functional_addrs': functional_addrs,
+            'informational_addrs': informational_addrs,
             'release_version': release_version,
             'client_version': client_version,
             'server_url': majorlogin_response.url,
@@ -2152,7 +2227,9 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
         cache_set(uid, account_data)
         return account_data
     except Exception as e:
+        import traceback
         print_error(f"process_account_uid_pass error: {e}")
+        traceback.print_exc()
         return None
 
 
@@ -2238,16 +2315,6 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
         if majorlogin_response is None:
             return None
 
-        getlogin_result = await send_getlogin(
-            login_payload_data,
-            majorlogin_response.url,
-            majorlogin_response.token,
-            release_version
-        )
-        if getlogin_result is None:
-            return None
-
-        res_proto, dict_res = getlogin_result
         acc_id = str(majorlogin_response.account_id)
 
         try:
@@ -2255,7 +2322,7 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
         except Exception:
             pass
 
-        nickname = res_proto.nickname or f"Player_{acc_id}"
+        nickname = f"Player_{acc_id[-6:]}"
         region = majorlogin_response.region or "BD"
         level = 1
         exp = 0
@@ -2266,19 +2333,40 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
             level=level, exp=exp, likes=likes
         )
 
-        profile = await fetch_player_profile(
-            acc_id, region, majorlogin_response.token
+        getlogin_result = await send_getlogin(
+            login_payload_data,
+            majorlogin_response.url,
+            majorlogin_response.token,
+            release_version
         )
-        if profile:
-            nickname = profile['nickname'] or nickname
-            region = profile['region'] or region
-            level = profile['level']
-            exp = profile['exp']
-            likes = profile['likes']
-            bot_state.register_account(
-                uid=acc_id, nickname=nickname, region=region,
-                level=level, exp=exp, likes=likes
-            )
+
+        functional_addrs = ""
+        informational_addrs = ""
+
+        if getlogin_result is None:
+            print_warning(f"[TOKEN] GetLoginData failed — registering with defaults")
+        else:
+            res_proto, dict_res = getlogin_result
+            functional_addrs = res_proto.functional_addrs or get_proto_field(dict_res, 14) or ""
+            informational_addrs = res_proto.informational_addrs or get_proto_field(dict_res, 32) or ""
+            if res_proto.nickname:
+                nickname = res_proto.nickname
+
+        try:
+            profile = await fetch_player_profile(acc_id, region, majorlogin_response.token)
+            if profile:
+                nickname = profile['nickname'] or nickname
+                region = profile['region'] or region
+                level = profile['level']
+                exp = profile['exp']
+                likes = profile['likes']
+        except Exception as e:
+            print_error(f"[PROFILE] Token initial fetch error: {e}")
+
+        bot_state.register_account(
+            uid=acc_id, nickname=nickname, region=region,
+            level=level, exp=exp, likes=likes
+        )
 
         account_data = {
             'account_id': majorlogin_response.account_id,
@@ -2294,8 +2382,8 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
             'server_time': majorlogin_response.server_time,
             'aes_ak': majorlogin_response.aes_ak,
             'iv_i': majorlogin_response.iv_i,
-            'functional_addrs': res_proto.functional_addrs or get_proto_field(dict_res, 14),
-            'informational_addrs': res_proto.informational_addrs or get_proto_field(dict_res, 32),
+            'functional_addrs': functional_addrs,
+            'informational_addrs': informational_addrs,
             'release_version': release_version,
             'client_version': client_version,
             'server_url': majorlogin_response.url,
@@ -2307,7 +2395,9 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
         cache_set(cache_key, account_data)
         return account_data
     except Exception as e:
+        import traceback
         print_error(f"process_account_token error: {e}")
+        traceback.print_exc()
         return None
 
 
@@ -2337,15 +2427,16 @@ async def run_account_worker(account_data: Dict, label: str):
             typ='ChaT'
         )
 
-        informational_task = asyncio.create_task(
-            informational(
-                account_data['informational_addrs'],
-                tcp_packet_chat,
-                account_data['aes_ak'],
-                account_data['iv_i'],
-                region=reg
+        if account_data.get('informational_addrs'):
+            informational_task = asyncio.create_task(
+                informational(
+                    account_data['informational_addrs'],
+                    tcp_packet_chat,
+                    account_data['aes_ak'],
+                    account_data['iv_i'],
+                    region=reg
+                )
             )
-        )
 
         async def exp_refresher():
             while True:
@@ -2377,20 +2468,24 @@ async def run_account_worker(account_data: Dict, label: str):
 
         exp_task = asyncio.create_task(exp_refresher())
 
-        functional_task = asyncio.create_task(
-            functional_lone_wolf(
-                account_data['functional_addrs'],
-                tcp_packet_online,
-                account_data['region'],
-                account_data['client_version'],
-                account_data['aes_ak'],
-                account_data['iv_i'],
-                account_id=acc_id,
-                account_data=account_data
+        if account_data.get('functional_addrs'):
+            functional_task = asyncio.create_task(
+                functional_lone_wolf(
+                    account_data['functional_addrs'],
+                    tcp_packet_online,
+                    account_data['region'],
+                    account_data['client_version'],
+                    account_data['aes_ak'],
+                    account_data['iv_i'],
+                    account_id=acc_id,
+                    account_data=account_data
+                )
             )
-        )
-
-        await functional_task
+            await functional_task
+        else:
+            print_error(f"[WORKER] No functional_addrs for {acc_id} — cannot start match loop")
+            while True:
+                await asyncio.sleep(60)
 
     except asyncio.CancelledError:
         raise
@@ -2435,6 +2530,7 @@ async def account_loop_guest(uid: str, password: str):
                 current_exp = int(account_data.get('exp', 0) or 0)
                 current_level = int(account_data.get('level', 1) or 1)
 
+            # CS engine routing for early levels
             if 48 <= current_exp < 202:
                 print_warning(f"[ROUTING] UID {uid} | Level {current_level} | exp={current_exp} → CS Engine")
                 try:
@@ -2442,23 +2538,26 @@ async def account_loop_guest(uid: str, password: str):
                 except Exception:
                     pass
                 try:
-                    sub_env = os.environ.copy()
-                    sub_env["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-                    proc = await asyncio.create_subprocess_exec(
-                        sys.executable, "cs.py", str(uid), str(password),
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT,
-                        env=sub_env
-                    )
-                    while True:
-                        line = await proc.stdout.readline()
-                        if not line:
-                            break
-                        log_msg = line.decode('utf-8', errors='replace').strip()
-                        if log_msg:
-                            print_colored(f"[CS-ENGINE:{uid}] {log_msg}", Colors.CYAN)
-                            bot_state.log(log_msg, "info", acc_id)
-                    await proc.wait()
+                    if os.path.exists("cs.py"):
+                        sub_env = os.environ.copy()
+                        sub_env["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+                        proc = await asyncio.create_subprocess_exec(
+                            sys.executable, "cs.py", str(uid), str(password),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.STDOUT,
+                            env=sub_env
+                        )
+                        while True:
+                            line = await proc.stdout.readline()
+                            if not line:
+                                break
+                            log_msg = line.decode('utf-8', errors='replace').strip()
+                            if log_msg:
+                                print_colored(f"[CS-ENGINE:{uid}] {log_msg}", Colors.CYAN)
+                                bot_state.log(log_msg, "info", acc_id)
+                        await proc.wait()
+                    else:
+                        print_warning("[CS-ENGINE] cs.py not found, skipping")
                 except Exception as e:
                     print_error(f"[CS-ENGINE] Subprocess error: {e}")
 
@@ -2552,7 +2651,7 @@ async def main():
     except Exception:
         pass
 
-    # -------- Start Web Dashboard FIRST (Render health check needs this) --------
+    # -------- Start Web Dashboard FIRST --------
     try:
         await start_web_dashboard(host=WEB_HOST, port=WEB_PORT)
         if PUBLIC_BASE_URL:
