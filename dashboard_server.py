@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-FreeFire Level Up Bot — Dashboard Server (FIXED + Render-ready)
+FreeFire Level Up Bot — Dashboard Server (FULL FIXED VERSION)
 Features:
-  - BR / Lone Wolf mode tracking (per-account level)
+  - Server-side credentials (cross-device login)
+  - Persistent owner mapping (survives refresh)
+  - Redis support (optional) + file fallback
+  - BR / Lone Wolf mode tracking
   - Pause / Resume / Stop / Restart / Delete
-  - Writer registry (clean socket shutdown)
-  - Dual-ID mapping (auth_uid ↔ game_id ↔ token_prefix)
-  - Real EXP progress (next_level, remaining, percent)
-  - Multi-candidate safe deletion
-  - Persistent owner ↔ account mapping (survives refresh)
-  - Render DATA_DIR aware paths
+  - Writer registry, dual-ID mapping
+  - Real EXP progress
 """
 
 import asyncio
@@ -32,8 +31,34 @@ except Exception:
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 OWNERS_FILE = os.path.join(DATA_DIR, "owners.json")
 ALIASES_FILE = os.path.join(DATA_DIR, "aliases.json")
+CREDS_FILE = os.path.join(DATA_DIR, "credentials.json")
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
 
-# ==================== EXP TABLE (Level 1 → 100) ====================
+# ==================== REDIS (Optional) ====================
+_REDIS = None
+_REDIS_TRIED = False
+
+def _get_redis():
+    global _REDIS, _REDIS_TRIED
+    if _REDIS_TRIED:
+        return _REDIS
+    _REDIS_TRIED = True
+    try:
+        from upstash_redis import Redis
+        url = os.getenv("UPSTASH_REDIS_REST_URL")
+        token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+        if url and token:
+            _REDIS = Redis(url=url, token=token)
+            print("[REDIS] Connected to Upstash", flush=True)
+        else:
+            print("[REDIS] No env vars → using file storage", flush=True)
+    except ImportError:
+        print("[REDIS] upstash-redis not installed → using file storage", flush=True)
+    except Exception as e:
+        print(f"[REDIS] Init failed: {e} → using file storage", flush=True)
+    return _REDIS
+
+# ==================== EXP TABLE ====================
 EXP_TABLE: Dict[int, int] = {
     1: 0, 2: 48, 3: 202, 4: 544, 5: 1012, 6: 1844, 7: 2792, 8: 3800,
     9: 4870, 10: 6004, 11: 7192, 12: 8448, 13: 9760, 14: 11140, 15: 12566,
@@ -57,7 +82,6 @@ MODE_SWITCH_LEVEL = 3
 
 
 def calculate_level_progress(level: int, current_exp: int) -> Dict[str, Any]:
-    """Calculate EXP progress within current level toward next level."""
     try:
         level = max(1, min(100, int(level or 1)))
     except (ValueError, TypeError):
@@ -87,7 +111,7 @@ def calculate_level_progress(level: int, current_exp: int) -> Dict[str, Any]:
     }
 
 
-# ==================== PERSISTENT STORAGE HELPERS ====================
+# ==================== FILE HELPERS ====================
 def _read_json(path: str, default):
     if not os.path.exists(path):
         return default
@@ -111,6 +135,177 @@ def _write_json(path: str, data) -> bool:
         return False
 
 
+# ==================== CREDENTIALS (Server-side) ====================
+def get_credential(email: str) -> Optional[Dict[str, Any]]:
+    email = str(email).lower().strip()
+    redis = _get_redis()
+    if redis:
+        try:
+            data = redis.hgetall(f"cred:{email}")
+            if data and data.get("email"):
+                return _normalize_cred(data)
+            return None
+        except Exception as e:
+            print(f"[CREDS] Redis get failed: {e}", flush=True)
+
+    creds = _read_json(CREDS_FILE, [])
+    for c in creds:
+        if str(c.get("email", "")).lower() == email:
+            return c
+    return None
+
+
+def list_credentials() -> List[Dict[str, Any]]:
+    redis = _get_redis()
+    if redis:
+        try:
+            emails = redis.smembers("all_creds") or []
+            out = []
+            for e in emails:
+                data = redis.hgetall(f"cred:{e}")
+                if data and data.get("email"):
+                    out.append(_normalize_cred(data))
+            out.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+            return out
+        except Exception as e:
+            print(f"[CREDS] Redis list failed: {e}", flush=True)
+
+    return _read_json(CREDS_FILE, [])
+
+
+def save_credential(payload: Dict[str, Any]) -> bool:
+    email = str(payload.get("email", "")).lower().strip()
+    if not email:
+        return False
+
+    redis = _get_redis()
+    if redis:
+        try:
+            redis.hset(f"cred:{email}", mapping={
+                "email": email,
+                "password": str(payload.get("password", "")),
+                "slots": str(payload.get("slots", 3)),
+                "label": str(payload.get("label", "")),
+                "days": str(payload.get("days", 0)),
+                "expiresAt": str(payload.get("expiresAt", 0)),
+                "revoked": "1" if payload.get("revoked") else "0",
+                "created_at": str(payload.get("created_at", int(time.time() * 1000))),
+            })
+            redis.sadd("all_creds", email)
+            return True
+        except Exception as e:
+            print(f"[CREDS] Redis save failed: {e}", flush=True)
+
+    creds = _read_json(CREDS_FILE, [])
+    creds = [c for c in creds if str(c.get("email", "")).lower() != email]
+    creds.insert(0, payload)
+    return _write_json(CREDS_FILE, creds)
+
+
+def delete_credential(email: str) -> bool:
+    email = str(email).lower().strip()
+    redis = _get_redis()
+    if redis:
+        try:
+            redis.delete(f"cred:{email}")
+            redis.srem("all_creds", email)
+            return True
+        except Exception as e:
+            print(f"[CREDS] Redis delete failed: {e}", flush=True)
+
+    creds = _read_json(CREDS_FILE, [])
+    creds = [c for c in creds if str(c.get("email", "")).lower() != email]
+    return _write_json(CREDS_FILE, creds)
+
+
+def set_credential_revoked(email: str, revoked: bool) -> bool:
+    email = str(email).lower().strip()
+    redis = _get_redis()
+    if redis:
+        try:
+            redis.hset(f"cred:{email}", {"revoked": "1" if revoked else "0"})
+            return True
+        except Exception as e:
+            print(f"[CREDS] Redis revoke failed: {e}", flush=True)
+
+    creds = _read_json(CREDS_FILE, [])
+    for c in creds:
+        if str(c.get("email", "")).lower() == email:
+            c["revoked"] = revoked
+    return _write_json(CREDS_FILE, creds)
+
+
+def _normalize_cred(data: Dict) -> Dict:
+    return {
+        "email": data.get("email", ""),
+        "password": data.get("password", ""),
+        "slots": int(data.get("slots", 3) or 3),
+        "label": data.get("label", ""),
+        "days": int(data.get("days", 0) or 0),
+        "expiresAt": int(data.get("expiresAt", 0) or 0),
+        "revoked": data.get("revoked") == "1" or data.get("revoked") is True,
+        "created_at": int(data.get("created_at", 0) or 0),
+    }
+
+
+# ==================== OWNER / ALIAS (Server-side) ====================
+def get_all_owners() -> Dict[str, str]:
+    redis = _get_redis()
+    if redis:
+        try:
+            data = redis.hgetall("owners") or {}
+            if data:
+                return {str(k): str(v) for k, v in data.items()}
+        except Exception as e:
+            print(f"[OWNERS] Redis get failed: {e}", flush=True)
+    return _read_json(OWNERS_FILE, {})
+
+
+def set_owner(uid: str, owner_email: str):
+    uid_str = str(uid).strip()
+    owner = str(owner_email).lower().strip()
+    if not uid_str or not owner:
+        return
+    redis = _get_redis()
+    if redis:
+        try:
+            redis.hset("owners", {uid_str: owner})
+        except Exception as e:
+            print(f"[OWNERS] Redis set failed: {e}", flush=True)
+    owners = _read_json(OWNERS_FILE, {})
+    owners[uid_str] = owner
+    _write_json(OWNERS_FILE, owners)
+
+
+def get_all_aliases() -> Dict[str, str]:
+    redis = _get_redis()
+    if redis:
+        try:
+            data = redis.hgetall("aliases") or {}
+            if data:
+                return {str(k): str(v) for k, v in data.items()}
+        except Exception as e:
+            print(f"[ALIASES] Redis get failed: {e}", flush=True)
+    return _read_json(ALIASES_FILE, {})
+
+
+def set_alias(input_uid: str, canonical_uid: str):
+    inp = str(input_uid).strip()
+    can = str(canonical_uid).strip()
+    if not inp or not can:
+        return
+    redis = _get_redis()
+    if redis:
+        try:
+            redis.hset("aliases", {inp: can, can: can})
+        except Exception as e:
+            print(f"[ALIASES] Redis set failed: {e}", flush=True)
+    aliases = _read_json(ALIASES_FILE, {})
+    aliases[inp] = can
+    aliases.setdefault(can, can)
+    _write_json(ALIASES_FILE, aliases)
+
+
 # ==================== BOT STATE ====================
 class BotState:
     def __init__(self):
@@ -129,34 +324,44 @@ class BotState:
         self.refresh_callbacks: Dict[str, Any] = {}
         self.account_credentials: Dict[str, Dict[str, Any]] = {}
         self.active_writers: Dict[str, Set[Any]] = {}
-        # NEW: persistent owner & alias mapping
         self.owners: Dict[str, str] = {}
         self.uid_aliases: Dict[str, str] = {}
 
     # ---------- Owner / Alias persistence ----------
     def load_owners_from_disk(self):
-        data = _read_json(OWNERS_FILE, {})
-        if isinstance(data, dict):
-            self.owners = data
+        self.owners = get_all_owners() or {}
+        print(f"[OWNERS] Loaded {len(self.owners)} mappings", flush=True)
 
     def save_owners_to_disk(self):
-        _write_json(OWNERS_FILE, self.owners)
+        for uid, owner in self.owners.items():
+            try:
+                set_owner(uid, owner)
+            except Exception:
+                pass
 
     def load_aliases_from_disk(self):
-        data = _read_json(ALIASES_FILE, {})
-        if isinstance(data, dict):
-            self.uid_aliases = data
+        self.uid_aliases = get_all_aliases() or {}
+        print(f"[ALIASES] Loaded {len(self.uid_aliases)} mappings", flush=True)
 
     def save_aliases_to_disk(self):
-        _write_json(ALIASES_FILE, self.uid_aliases)
+        for inp, can in self.uid_aliases.items():
+            try:
+                set_alias(inp, can)
+            except Exception:
+                pass
 
     def set_owner(self, uid: str, owner_email: str):
         if not uid or not owner_email:
             return
-        self.owners[str(uid)] = str(owner_email)
-        if str(uid) in self.accounts:
-            self.accounts[str(uid)]["owner"] = str(owner_email)
-        self.save_owners_to_disk()
+        uid_str = str(uid)
+        owner = str(owner_email).lower().strip()
+        self.owners[uid_str] = owner
+        if uid_str in self.accounts:
+            self.accounts[uid_str]["owner"] = owner
+        try:
+            set_owner(uid_str, owner)
+        except Exception:
+            pass
 
     def set_alias(self, input_uid: str, canonical_uid: str):
         if not input_uid or not canonical_uid:
@@ -165,14 +370,19 @@ class BotState:
         can = str(canonical_uid)
         self.uid_aliases[inp] = can
         self.uid_aliases.setdefault(can, can)
-        # propagate owner
         owner = self.owners.get(inp)
         if owner:
             self.owners[can] = owner
             if can in self.accounts:
                 self.accounts[can]["owner"] = owner
-        self.save_aliases_to_disk()
-        self.save_owners_to_disk()
+            try:
+                set_owner(can, owner)
+            except Exception:
+                pass
+        try:
+            set_alias(inp, can)
+        except Exception:
+            pass
 
     # ---------- Writer registry ----------
     def register_writer(self, uid: str, writer):
@@ -229,25 +439,41 @@ class BotState:
     # ---------- Account registration ----------
     def register_account(self, uid: str, nickname: str, region: str, level: int, exp: int,
                          likes: int = 0, token: Optional[str] = None,
-                         auth_uid: Optional[str] = None):
+                         auth_uid: Optional[str] = None, owner: str = ""):
         uid_str = str(uid)
         auth_uid_str = str(auth_uid) if auth_uid else self.game_to_auth_id.get(uid_str, "")
 
-        # Dual-ID mapping
         if auth_uid_str:
             self.auth_to_game_id[auth_uid_str] = uid_str
             self.game_to_auth_id[uid_str] = auth_uid_str
             self.account_token_map[auth_uid_str] = uid_str
             self.account_token_map[uid_str] = auth_uid_str
-            # Propagate owner from input → game_id
-            owner = self.owners.get(auth_uid_str)
-            if owner:
-                self.owners[uid_str] = owner
+
         if token:
             self.account_token_map[uid_str] = token
             self.account_token_map[token[:16]] = uid_str
             if auth_uid_str:
                 self.account_token_map[auth_uid_str] = token
+
+        # Resolve owner: explicit > existing > auth_uid mapping
+        owner_final = (
+            owner
+            or self.owners.get(uid_str)
+            or (self.owners.get(auth_uid_str) if auth_uid_str else "")
+            or ""
+        )
+        owner_final = str(owner_final).lower().strip()
+
+        if owner_final:
+            self.owners[uid_str] = owner_final
+            if auth_uid_str:
+                self.owners[auth_uid_str] = owner_final
+            try:
+                set_owner(uid_str, owner_final)
+                if auth_uid_str:
+                    set_owner(auth_uid_str, owner_final)
+            except Exception:
+                pass
 
         try:
             lvl_val = max(1, int(level or 1))
@@ -259,18 +485,12 @@ class BotState:
             exp_val = 0
 
         prog = calculate_level_progress(lvl_val, exp_val)
-
         acc_mode = "BR" if lvl_val < MODE_SWITCH_LEVEL else "LONE_WOLF"
         acc_mode_label = (
             f"Battle Royale (Lvl < {MODE_SWITCH_LEVEL})"
             if lvl_val < MODE_SWITCH_LEVEL
             else f"Lone Wolf (Lvl ≥ {MODE_SWITCH_LEVEL})"
         )
-
-        # Resolve owner for this account (from auth_uid, game_id or token)
-        owner_for_this = (
-            self.owners.get(auth_uid_str) if auth_uid_str else None
-        ) or self.owners.get(uid_str, "")
 
         if uid_str not in self.accounts:
             self.accounts[uid_str] = {
@@ -296,7 +516,7 @@ class BotState:
                 "active_matches": 0,
                 "last_match_time": None,
                 "token": token or "",
-                "owner": owner_for_this or "",
+                "owner": owner_final,
                 "start_time": time.time(),
                 "is_paused": self.is_paused(uid_str),
                 "paused_at": time.time() if self.is_paused(uid_str) else None,
@@ -315,8 +535,8 @@ class BotState:
                 acc["level"] = lvl_val
             if token:
                 acc["token"] = token
-            if owner_for_this:
-                acc["owner"] = owner_for_this
+            if owner_final:
+                acc["owner"] = owner_final
             acc["current_exp"] = exp_val
             acc["gained_exp"] = max(0, exp_val - acc.get("initial_exp", exp_val))
             acc["next_level"] = prog["next_level"]
@@ -575,8 +795,18 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         acc["uptime_seconds"] = bot_state.get_account_uptime(uid_k)
         acc["is_paused"] = bot_state.is_paused(uid_k)
         acc["mode"] = bot_state.get_account_mode(uid_k)
-        # 🔥 Expose owner so frontend can filter + count slots
-        acc["owner"] = bot_state.owners.get(uid_k, acc.get("owner", ""))
+        # Resolve owner: uid → alias → auth_uid
+        owner = bot_state.owners.get(uid_k, "")
+        if not owner:
+            auth_uid = acc.get("auth_uid", "")
+            if auth_uid:
+                owner = bot_state.owners.get(str(auth_uid), "")
+        if not owner:
+            for inp, can in bot_state.uid_aliases.items():
+                if str(can) == uid_k and inp in bot_state.owners:
+                    owner = bot_state.owners[inp]
+                    break
+        acc["owner"] = owner
 
     return web.json_response({
         "total_accounts": len(bot_state.accounts),
@@ -586,18 +816,126 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         "total_gained_exp": total_gained,
         "exp_per_hour": exp_per_hour,
         "accounts": accounts_data,
-        "owners": dict(bot_state.owners),        # 🔥 NEW
-        "aliases": dict(bot_state.uid_aliases),  # 🔥 NEW
+        "owners": dict(bot_state.owners),
+        "aliases": dict(bot_state.uid_aliases),
         "logs": bot_state.logs[-80:],
         "uptime": uptime_sec,
         "mode_switch_level": MODE_SWITCH_LEVEL,
     })
 
 
+# ==================== AUTH ====================
+ADMIN_EMAIL = "skyasinali221@gmail.com"
+ADMIN_PASSWORD = "skyasin"
+
+
+async def handle_login(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        email = str(data.get("email", "")).lower().strip()
+        password = str(data.get("password", ""))
+
+        if not email or not password:
+            return web.json_response({"status": "error", "error": "Email & password required"})
+
+        # Admin check
+        if email == ADMIN_EMAIL.lower() and password == ADMIN_PASSWORD:
+            return web.json_response({
+                "status": "ok",
+                "role": "admin",
+                "credential": {
+                    "email": ADMIN_EMAIL,
+                    "slots": 9999,
+                    "expiresAt": 0,
+                    "label": "ADMIN"
+                }
+            })
+
+        # User check from storage
+        cred = get_credential(email)
+        if not cred:
+            return web.json_response({"status": "error", "error": "Invalid credentials"})
+        if str(cred.get("password", "")) != password:
+            return web.json_response({"status": "error", "error": "Invalid credentials"})
+        if cred.get("revoked"):
+            return web.json_response({"status": "error", "error": "Account revoked"})
+        exp = int(cred.get("expiresAt", 0) or 0)
+        if exp > 0 and time.time() * 1000 > exp:
+            return web.json_response({"status": "error", "error": "Plan expired"})
+
+        return web.json_response({
+            "status": "ok",
+            "role": "user",
+            "credential": {
+                "email": email,
+                "slots": int(cred.get("slots", 3) or 3),
+                "expiresAt": exp,
+                "label": cred.get("label", "")
+            }
+        })
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)})
+
+
+async def handle_save_credential(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        email = str(data.get("email", "")).lower().strip()
+        if not email or not data.get("password"):
+            return web.json_response({"status": "error", "error": "Missing fields"})
+
+        ok = save_credential({
+            "email": email,
+            "password": str(data.get("password", "")),
+            "slots": int(data.get("slots", 3) or 3),
+            "label": str(data.get("label", "")),
+            "days": int(data.get("days", 0) or 0),
+            "expiresAt": int(data.get("expiresAt", 0) or 0),
+            "revoked": bool(data.get("revoked", False)),
+            "created_at": int(time.time() * 1000),
+        })
+        if not ok:
+            return web.json_response({"status": "error", "error": "Save failed"})
+        return web.json_response({"status": "ok", "email": email})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)})
+
+
+async def handle_list_credentials(request: web.Request) -> web.Response:
+    try:
+        creds = list_credentials()
+        return web.json_response({"status": "ok", "credentials": creds})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)})
+
+
+async def handle_credential_action(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        email = str(data.get("email", "")).lower().strip()
+        action = data.get("action", "")
+        if not email or not action:
+            return web.json_response({"status": "error", "error": "Missing fields"})
+
+        if action == "delete":
+            delete_credential(email)
+            return web.json_response({"status": "ok", "action": "deleted"})
+        if action == "revoke":
+            set_credential_revoked(email, True)
+            return web.json_response({"status": "ok", "action": "revoked"})
+        if action == "restore":
+            set_credential_revoked(email, False)
+            return web.json_response({"status": "ok", "action": "restored"})
+        return web.json_response({"status": "error", "error": "Unknown action"})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)})
+
+
+# ==================== ACCOUNT HANDLERS ====================
 async def handle_add_account(request: web.Request) -> web.Response:
     try:
         data = await request.json()
-        owner_email = str(data.get("owner", "")).strip()
+        owner_email = str(data.get("owner", "")).lower().strip()
 
         existing = _read_json(ACCOUNTS_FILE, [])
         if not isinstance(existing, list):
@@ -607,7 +945,7 @@ async def handle_add_account(request: web.Request) -> web.Response:
             uid = str(data["uid"]).strip()
             pwd = str(data["password"]).strip()
             if not uid or not pwd:
-                return web.json_response({"status": "error", "error": "UID and Password are required"})
+                return web.json_response({"status": "error", "error": "UID and Password required"})
 
             if uid in bot_state.account_workers:
                 try:
@@ -621,20 +959,21 @@ async def handle_add_account(request: web.Request) -> web.Response:
             if owner_email:
                 entry["owner"] = owner_email
             existing.append(entry)
-            identifier = uid
-            # 🔥 Save owner mapping immediately
+
             if owner_email:
                 bot_state.set_owner(uid, owner_email)
                 bot_state.set_alias(uid, uid)
 
+            identifier = uid
+
         elif "token" in data:
             token = str(data["token"]).strip()
             if not token:
-                return web.json_response({"status": "error", "error": "Token is required"})
+                return web.json_response({"status": "error", "error": "Token required"})
 
             tok_key = token[:16]
             for k in list(bot_state.account_workers.keys()):
-                if k == tok_key or k.startswith(tok_key[:10]) or tok_key.startswith(k[:10]):
+                if k == tok_key or k.startswith(tok_key[:10]):
                     try:
                         bot_state.account_workers[k].cancel()
                     except Exception:
@@ -646,15 +985,17 @@ async def handle_add_account(request: web.Request) -> web.Response:
             if owner_email:
                 entry["owner"] = owner_email
             existing.append(entry)
-            identifier = f"Token_{token[:8]}..."
+
             if owner_email:
                 bot_state.set_owner(tok_key, owner_email)
+                bot_state.set_alias(tok_key, tok_key)
+
+            identifier = f"Token_{token[:8]}..."
         else:
             return web.json_response({"status": "error", "error": "Invalid payload"})
 
         _write_json(ACCOUNTS_FILE, existing)
-
-        bot_state.log(f"New account added: {identifier}", "success")
+        bot_state.log(f"New account added: {identifier} (owner: {owner_email or 'none'})", "success")
 
         cb = bot_state.refresh_callbacks.get("on_account_added")
         if cb:
@@ -700,47 +1041,10 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                 if t:
                     target_tokens.add(str(t))
 
-        for cid in list(candidate_ids):
-            creds = bot_state.account_credentials.get(cid, {})
-            if creds:
-                if creds.get("auth_uid"):
-                    candidate_ids.add(str(creds["auth_uid"]))
-                if creds.get("account_id"):
-                    candidate_ids.add(str(creds["account_id"]))
-                t = creds.get("token") or creds.get("access_token") or creds.get("auth_token")
-                if t:
-                    target_tokens.add(str(t))
-
-        # Clean token_cache.json
-        token_cache_file = os.path.join(DATA_DIR, "token_cache.json")
-        if os.path.exists(token_cache_file):
-            try:
-                with open(token_cache_file, "r", encoding="utf-8") as f:
-                    tcache = json.load(f)
-                dirty_cache = False
-                for k, v in list(tcache.items()):
-                    k_str = str(k)
-                    v_acc_id = str(v.get("account_id", ""))
-                    v_auth_uid = str(v.get("auth_uid", ""))
-                    if k_str in candidate_ids or v_acc_id in candidate_ids or v_auth_uid in candidate_ids:
-                        candidate_ids.add(k_str)
-                        if v_acc_id:
-                            candidate_ids.add(v_acc_id)
-                        if v_auth_uid:
-                            candidate_ids.add(v_auth_uid)
-                        del tcache[k]
-                        dirty_cache = True
-                if dirty_cache:
-                    with open(token_cache_file, "w", encoding="utf-8") as f:
-                        json.dump(tcache, f, indent=2)
-            except Exception:
-                pass
-
         # Clean accounts.json
         if os.path.exists(ACCOUNTS_FILE):
             try:
-                with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
+                existing = _read_json(ACCOUNTS_FILE, [])
                 if not isinstance(existing, list):
                     existing = []
                 new_existing = []
@@ -752,37 +1056,9 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                         is_match = True
                     if acc_tok and (acc_tok in candidate_ids or acc_tok in target_tokens):
                         is_match = True
-                    for tok in target_tokens:
-                        if acc_tok and (acc_tok.startswith(tok[:16]) or tok.startswith(acc_tok[:16])):
-                            is_match = True
                     if not is_match:
                         new_existing.append(acc)
                 _write_json(ACCOUNTS_FILE, new_existing)
-            except Exception:
-                pass
-
-        # Clean devices.json
-        devices_file = os.path.join(DATA_DIR, "devices.json")
-        if os.path.exists(devices_file):
-            try:
-                with open(devices_file, "r", encoding="utf-8") as f:
-                    devices_data = json.load(f)
-                if isinstance(devices_data, dict):
-                    dirty_devices = False
-                    for dev_k in list(devices_data.keys()):
-                        dev_k_str = str(dev_k)
-                        if dev_k_str in candidate_ids:
-                            del devices_data[dev_k]
-                            dirty_devices = True
-                        else:
-                            for tok in target_tokens:
-                                if dev_k_str == tok[:16] or tok.startswith(dev_k_str):
-                                    del devices_data[dev_k]
-                                    dirty_devices = True
-                                    break
-                    if dirty_devices:
-                        with open(devices_file, "w", encoding="utf-8") as f:
-                            json.dump(devices_data, f, indent=4)
             except Exception:
                 pass
 
@@ -803,13 +1079,7 @@ async def handle_delete_account(request: web.Request) -> web.Response:
         cancelled_keys = []
         for k, worker in list(bot_state.account_workers.items()):
             k_str = str(k)
-            should_cancel = False
             if k_str in candidate_ids:
-                should_cancel = True
-            for tok in target_tokens:
-                if k_str == tok[:16] or tok.startswith(k_str[:10]):
-                    should_cancel = True
-            if should_cancel:
                 try:
                     worker.cancel()
                 except Exception:
@@ -829,8 +1099,7 @@ async def handle_delete_account(request: web.Request) -> web.Response:
             except Exception:
                 pass
 
-        target_repr = req_uid or req_auth_uid
-        bot_state.log(f"Account {target_repr} completely deleted.", "warning", target_repr)
+        bot_state.log(f"Account {req_uid or req_auth_uid} deleted.", "warning")
         bot_state.recalc_totals()
         return web.json_response({"status": "ok", "deleted": list(candidate_ids)})
     except Exception as e:
@@ -862,13 +1131,6 @@ async def handle_restart_account(request: web.Request) -> web.Response:
                 asyncio.create_task(cb(uid))
             except Exception as e:
                 bot_state.log(f"restart callback error: {e}", "error")
-        else:
-            cb2 = bot_state.refresh_callbacks.get("on_refresh_account")
-            if cb2:
-                try:
-                    asyncio.create_task(cb2(uid))
-                except Exception:
-                    pass
         return web.json_response({"status": "ok"})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
@@ -884,7 +1146,7 @@ async def handle_toggle_pause(request: web.Request) -> web.Response:
         data = await request.json()
         uid = str(data.get("uid", "")).strip()
         if not uid:
-            return web.json_response({"status": "error", "error": "UID is required"})
+            return web.json_response({"status": "error", "error": "UID required"})
         is_paused = bot_state.toggle_pause(uid)
         return web.json_response({"status": "ok", "is_paused": is_paused})
     except Exception as e:
@@ -901,13 +1163,22 @@ async def handle_toggle_pause_all(request: web.Request) -> web.Response:
 
 # ==================== SERVER START ====================
 async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
-    # Load persistent owner/alias maps at startup
     bot_state.load_owners_from_disk()
     bot_state.load_aliases_from_disk()
 
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/stats", handle_get_stats)
+
+    # Auth
+    app.router.add_post("/api/auth/login", handle_login)
+
+    # Admin credentials
+    app.router.add_post("/api/admin/save-credential", handle_save_credential)
+    app.router.add_get("/api/admin/list-credentials", handle_list_credentials)
+    app.router.add_post("/api/admin/credential-action", handle_credential_action)
+
+    # Account management
     app.router.add_post("/api/account/add", handle_add_account)
     app.router.add_post("/api/account/delete", handle_delete_account)
     app.router.add_post("/api/account/remove", handle_delete_account)
